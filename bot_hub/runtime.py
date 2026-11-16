@@ -8,6 +8,10 @@ import json
 import logging
 import time
 from pathlib import Path
+from types import SimpleNamespace
+
+import discord
+from discord import app_commands
 
 
 from parent_ai.__main__ import Parent
@@ -19,6 +23,7 @@ class HubParent(Parent):
     def __init__(self, config, instance, state, restart_chat):
         self.instance, self.hub_state = instance, state
         super().__init__(config)
+        self.tree = app_commands.CommandTree(self)
         self.changes.restart = restart_chat
         # The maintenance agent must remain recoverable while editing its child.
         original_editable = self.changes.editable
@@ -75,6 +80,12 @@ class HubParent(Parent):
             )
         )
 
+    async def setup_hook(self):
+        await super().setup_hook()
+        guild = discord.Object(id=int(self.config["guild_id"]))
+        self.tree.copy_global_to(guild=guild)
+        await self.tree.sync(guild=guild)
+
     async def on_ready(self):
         self.emit("connection.ready", {"user_id": str(self.user.id)})
         await super().on_ready()
@@ -93,6 +104,16 @@ class HubParent(Parent):
                 "note": fields.get("note"),
             },
         )
+        if fields.get("thread") and getattr(self, "hub_runtime", None):
+            job = self.get(job_id)
+            if job and str(job["source"]) == str(fields["thread"]):
+                self.hub_runtime.name_new_thread(
+                    self,
+                    fields["thread"],
+                    job["request"],
+                    expected_name=f"Skill Issue #{job_id} · {job['request'][:65]}",
+                    prefix=f"Skill Issue #{job_id} · ",
+                )
         if fields.get("proposal"):
             proposal = json.loads(fields["proposal"])
             self.emit(
@@ -106,6 +127,8 @@ class HubParent(Parent):
             )
 
     async def progress(self, job_id, message):
+        if self.cleanup_running():
+            return
         self.emit("maintenance.progress", {"job_id": job_id, "message": message})
         if message.startswith(("Tool call **", "Tool result **")):
             completed = message.startswith("Tool result")
@@ -115,8 +138,84 @@ class HubParent(Parent):
             )
         await super().progress(job_id, message)
 
+    def cleanup_running(self):
+        runtime = getattr(self, "hub_runtime", None)
+        return bool(
+            runtime and runtime.cleanup.is_running(str(self.config["guild_id"]))
+        )
+
+    async def card(self, job_id, attach=False):
+        if not self.cleanup_running():
+            await super().card(job_id, attach=attach)
+
+    async def on_raw_message_edit(self, payload):
+        if self.cleanup_running():
+            return
+        try:
+            await super().on_raw_message_edit(payload)
+        finally:
+            if getattr(self, "hub_runtime", None):
+                await self.hub_runtime.observe_edited_message(self, payload)
+
+    async def on_raw_message_delete(self, payload):
+        if self.cleanup_running():
+            return
+        try:
+            await super().on_raw_message_delete(payload)
+        finally:
+            if getattr(self, "hub_runtime", None) and str(
+                getattr(payload, "guild_id", "")
+            ) == str(self.config["guild_id"]):
+                await self.hub_runtime.remove_project_sources(
+                    self, message_ids=[payload.message_id]
+                )
+
+    async def on_raw_bulk_message_delete(self, payload):
+        if (
+            not self.cleanup_running()
+            and getattr(self, "hub_runtime", None)
+            and str(getattr(payload, "guild_id", "")) == str(self.config["guild_id"])
+        ):
+            try:
+                for message_id in payload.message_ids:
+                    await super().on_raw_message_delete(
+                        SimpleNamespace(
+                            message_id=message_id,
+                            channel_id=payload.channel_id,
+                            guild_id=payload.guild_id,
+                        )
+                    )
+            finally:
+                await self.hub_runtime.remove_project_sources(
+                    self, message_ids=payload.message_ids
+                )
+
+    async def on_thread_delete(self, thread):
+        if (
+            not self.cleanup_running()
+            and getattr(self, "hub_runtime", None)
+            and self.hub_runtime.project_channel_allowed(self, thread)
+        ):
+            await self.hub_runtime.remove_project_sources(self, thread_ids=[thread.id])
+
+    async def on_raw_thread_delete(self, payload):
+        channels = self.instance.get("channels") or [self.config["channel_id"]]
+        if (
+            not self.cleanup_running()
+            and getattr(self, "hub_runtime", None)
+            and str(payload.guild_id) == str(self.config["guild_id"])
+            and str(payload.parent_id) in {str(value) for value in channels}
+        ):
+            await self.hub_runtime.remove_project_sources(
+                self, thread_ids=[payload.thread_id]
+            )
+
     async def on_message(self, message):
+        if self.cleanup_running():
+            return
         if not message.author.bot and self.allowed(message.channel):
+            if getattr(self, "hub_runtime", None):
+                await self.hub_runtime.observe_discord_message(self, message)
             self.emit(
                 "message.received",
                 {
@@ -136,6 +235,18 @@ class HubParent(Parent):
                     },
                 )
         await super().on_message(message)
+
+    def job_finished(self, job_id):
+        self.active_jobs.pop(job_id, None)
+        runtime = getattr(self, "hub_runtime", None)
+        if not self.cleanup_running() and not (runtime and runtime.closed):
+            self.wake.set()
+
+    async def process_job(self, job_id):
+        runtime = getattr(self, "hub_runtime", None)
+        if self.cleanup_running() or (runtime and runtime.closed):
+            return
+        await super().process_job(job_id)
 
     async def work(self):
         if not self.instance.get("dry_run"):
@@ -182,6 +293,305 @@ class Runtime:
         self.component_dispatch_tasks = {}
         self.closed = False
         self.registry_lock = asyncio.Lock()
+        self.naming_tasks = {}
+        self.pending_thread_names = {}
+        from .cleanup import CleanupManager
+        from .projects import ProjectOrganizer
+
+        gateway = json.loads(
+            Path(config.get("gateway_config_file", "config.json")).read_text()
+        )
+        self.cleanup = CleanupManager(self, state)
+        self.projects = ProjectOrganizer(state, gateway)
+
+    def install_commands(self, client):
+        """Expose guild-wide management commands on either physical bot identity."""
+        from .cleanup import install_commands, status_view
+
+        install_commands(client, self)
+        tree = client.tree
+        if tree.get_command("projects") is None:
+
+            @tree.command(
+                name="projects",
+                description="Show the projects discussed in this server",
+            )
+            async def projects_command(interaction: discord.Interaction):
+                if not interaction.guild or str(interaction.guild.id) != str(
+                    client.config["guild_id"]
+                ):
+                    await interaction.response.send_message(
+                        "Use this command in the configured server.", ephemeral=True
+                    )
+                    return
+                await interaction.response.defer(thinking=True)
+                snapshot = self.projects.snapshot(str(interaction.guild.id))
+                projects = snapshot.get("projects", [])
+                descriptions = []
+                for project in projects[:8]:
+                    name = (
+                        project.get("name")
+                        or project.get("title")
+                        or project.get("id", "Project")
+                    )
+                    descriptions.append(
+                        f"**{name}**\n{str(project.get('summary', ''))[:350]}"
+                    )
+                embed = discord.Embed(
+                    title="Projects",
+                    description="\n\n".join(descriptions)[:4000]
+                    or "Projects will appear as new conversations develop.",
+                )
+                embed.set_footer(
+                    text=f"{len(projects)} projects · Fresh server conversations"
+                )
+                await interaction.followup.send(embed=embed)
+
+        tree.remove_command("status")
+
+        @tree.command(
+            name="status", description="Show bot status and server cleanup controls"
+        )
+        async def status_command(interaction: discord.Interaction):
+            if not interaction.guild or str(interaction.guild.id) != str(
+                client.config["guild_id"]
+            ):
+                await interaction.response.send_message(
+                    "Use this command in the configured server.", ephemeral=True
+                )
+                return
+            text = f"Online · {round(client.latency * 1000)} ms"
+            if hasattr(client, "engine"):
+                model = client.store.model(
+                    str(interaction.channel_id), client.config["default_model"]
+                )
+                text += (
+                    f"\nGateway `{client.config['base_url']}`\nRoute `{model}`"
+                    f"\n{len(client.engine.models)} routes · {len(client.engine.skills)} skills · {len(client.engine.tools)} connector tools"
+                )
+            else:
+                text += f"\nSkill Issue Department · Route `{client.config.get('model', 'auto/best-free')}`"
+            await interaction.response.send_message(
+                text, view=status_view(client, self)
+            )
+
+    def project_channel_allowed(self, client, channel):
+        if not channel or not getattr(channel, "guild", None):
+            return False
+        if str(channel.guild.id) != str(
+            client.config["guild_id"]
+        ) or not client.allowed(channel):
+            return False
+        excluded = {str(value) for value in client.config.get("excluded_channels", [])}
+        return (
+            str(channel.id) not in excluded
+            and str(getattr(channel, "parent_id", "")) not in excluded
+        )
+
+    @staticmethod
+    def observation_content(message):
+        content = (getattr(message, "content", "") or "")[:8000]
+        attachments = []
+        remaining = 3898
+        for attachment in list(getattr(message, "attachments", []))[:10]:
+            metadata = {
+                "filename": str(getattr(attachment, "filename", ""))[:200],
+                "content_type": str(getattr(attachment, "content_type", None) or "")[
+                    :100
+                ],
+                "url": str(getattr(attachment, "url", ""))[:2048],
+            }
+            size = len(json.dumps(metadata, ensure_ascii=False)) + 2
+            if size > remaining:
+                break
+            attachments.append(metadata)
+            remaining -= size
+        if attachments:
+            content += "\nAttachments\n" + json.dumps(attachments, ensure_ascii=False)
+        return content
+
+    async def observe_message(
+        self, client, channel, message_id, author, content, role="human", kind="message"
+    ):
+        if (
+            (not content and kind != "edit")
+            or not message_id
+            or not getattr(channel, "guild", None)
+        ):
+            return
+        if str(channel.guild.id) != str(
+            client.config["guild_id"]
+        ) or self.cleanup.is_running(str(channel.guild.id)):
+            return
+        try:
+            await self.projects.observe(
+                client.instance["id"],
+                str(channel.guild.id),
+                str(channel.id),
+                str(message_id),
+                {"id": str(author.id), "name": author.display_name, "role": role},
+                content,
+                thread_id=str(channel.id)
+                if isinstance(channel, discord.Thread)
+                else None,
+                kind=kind,
+            )
+        except Exception as error:
+            self.state.record(
+                client.instance["id"],
+                "project.observe_failed",
+                {"error": type(error).__name__},
+            )
+
+    async def observe_discord_message(self, client, message, kind="message"):
+        if message.author.bot or not self.project_channel_allowed(
+            client, message.channel
+        ):
+            return
+        await self.observe_message(
+            client,
+            message.channel,
+            message.id,
+            message.author,
+            self.observation_content(message),
+            kind=kind,
+        )
+
+    async def observe_edited_message(self, client, event):
+        if (
+            self.cleanup.is_running(str(client.config["guild_id"]))
+            or str(getattr(event, "guild_id", "")) != str(client.config["guild_id"])
+            or not {"content", "attachments"}.intersection(event.data)
+        ):
+            return
+        try:
+            channel = client.get_channel(
+                event.channel_id
+            ) or await client.fetch_channel(event.channel_id)
+            if self.project_channel_allowed(client, channel):
+                message = await channel.fetch_message(event.message_id)
+                await self.observe_discord_message(client, message, kind="edit")
+        except Exception as error:
+            self.state.record(
+                client.instance["id"],
+                "project.edit_observe_failed",
+                {"error": type(error).__name__},
+            )
+
+    async def remove_project_sources(self, client, message_ids=(), thread_ids=()):
+        if self.cleanup.is_running(str(client.config["guild_id"])):
+            return
+        try:
+            await self.projects.remove_sources(
+                [str(value) for value in message_ids],
+                [str(value) for value in thread_ids],
+            )
+        except Exception as error:
+            self.state.record(
+                client.instance["id"],
+                "project.remove_sources_failed",
+                {"error": type(error).__name__},
+            )
+
+    def remember_thread(self, client, thread):
+        self.pending_thread_names[str(thread.id)] = {
+            "instance_id": client.instance["id"],
+            "guild_id": str(thread.guild.id),
+            "expected_name": thread.name,
+            "prefix": "",
+        }
+
+    def name_new_thread(self, client, thread_id, text, expected_name=None, prefix=""):
+        thread_id = str(thread_id)
+        if expected_name is not None:
+            self.pending_thread_names.setdefault(
+                thread_id,
+                {
+                    "instance_id": client.instance["id"],
+                    "guild_id": str(client.config["guild_id"]),
+                    "expected_name": expected_name,
+                    "prefix": prefix,
+                },
+            )
+        if self.cleanup.is_running(str(client.config["guild_id"])):
+            return
+        if thread_id not in self.pending_thread_names or thread_id in self.naming_tasks:
+            return
+        text = text.strip()
+        if not text or text.lower().rstrip("!?.") in {
+            "hi",
+            "hello",
+            "hey",
+            "thanks",
+            "ok",
+            "okay",
+            "yes",
+            "no",
+            "ping",
+        }:
+            return
+        task = asyncio.create_task(self._name_thread(client, thread_id, text))
+        self.naming_tasks[thread_id] = task
+        task.add_done_callback(lambda done: self.naming_tasks.pop(thread_id, None))
+
+    async def _name_thread(self, client, thread_id, text):
+        pending = self.pending_thread_names[thread_id]
+        try:
+            thread = client.get_channel(int(thread_id)) or await client.fetch_channel(
+                int(thread_id)
+            )
+            if thread.name != pending["expected_name"]:
+                self.pending_thread_names.pop(thread_id, None)
+                return
+            title = await self.projects.name_thread(
+                str(thread.guild.id), thread_id, text, instance_id=client.instance["id"]
+            )
+            # Re-read the cache because Discord may have replaced the thread object.
+            thread = client.get_channel(int(thread_id)) or thread
+            if thread.name != pending["expected_name"] or self.cleanup.is_running(
+                str(thread.guild.id)
+            ):
+                self.pending_thread_names.pop(thread_id, None)
+                return
+            title = (pending["prefix"] + title)[:100]
+            await thread.edit(
+                name=title, reason="Name a new AI thread from its first prompt"
+            )
+            if hasattr(client, "store"):
+                conversation = client.store.conversation(thread_id)
+                if conversation:
+                    client.store.conversation(thread_id, title, conversation["creator"])
+            self.pending_thread_names.pop(thread_id, None)
+            self.state.record(
+                client.instance["id"],
+                "thread.named",
+                {"thread_id": thread_id, "name": title, "model": "auto/fast"},
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            self.state.record(
+                client.instance["id"],
+                "thread.naming_failed",
+                {"thread_id": thread_id, "error": type(error).__name__},
+            )
+
+    async def cancel_thread_naming(self, guild_id):
+        thread_ids = [
+            thread_id
+            for thread_id, item in self.pending_thread_names.items()
+            if item.get("guild_id") == str(guild_id)
+        ]
+        tasks = [
+            self.naming_tasks[thread_id]
+            for thread_id in thread_ids
+            if thread_id in self.naming_tasks
+        ]
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        for thread_id in thread_ids:
+            self.pending_thread_names.pop(thread_id, None)
 
     def instances(self):
         merged = {
@@ -348,13 +758,17 @@ class Runtime:
         if preset == "chat":
             client = HubTogether(path, config, instance, self.state)
             client.hub_runtime = self
+            self.install_commands(client)
             return client, token
         if preset == "maintenance":
             config["guild_id"] = int(config["guild_id"])
             config["model"] = model
             if instance.get("channels"):
                 config["channel_id"] = int(instance["channels"][0])
-            return HubParent(config, instance, self.state, self.restart_chat), token
+            client = HubParent(config, instance, self.state, self.restart_chat)
+            client.hub_runtime = self
+            self.install_commands(client)
+            return client, token
         from .predictor import Predictor
 
         return Predictor(instance, self.state, config), token
@@ -459,6 +873,10 @@ class Runtime:
 
     def dispatch_components(self, host_id, message):
         """Schedule prediction and grading without delaying the host conversation."""
+        if getattr(message, "guild", None) and self.cleanup.is_running(
+            str(message.guild.id)
+        ):
+            return
         for instance_id, identity_id in list(self.component_hosts.items()):
             component = self.clients.get(instance_id)
             if (
@@ -550,6 +968,21 @@ class Runtime:
 
     async def _stop(self, instance_id):
         await self._stop_dependents(instance_id)
+        pending_names = [
+            thread_id
+            for thread_id, item in self.pending_thread_names.items()
+            if item["instance_id"] == instance_id
+        ]
+        naming = [
+            self.naming_tasks[thread_id]
+            for thread_id in pending_names
+            if thread_id in self.naming_tasks
+        ]
+        for task in naming:
+            task.cancel()
+        await asyncio.gather(*naming, return_exceptions=True)
+        for thread_id in pending_names:
+            self.pending_thread_names.pop(thread_id, None)
         task = self.tasks.pop(instance_id, None)
         if task:
             task.cancel()
@@ -573,6 +1006,11 @@ class Runtime:
 
     async def close(self):
         self.closed = True
-        async with self.registry_lock:
-            for instance_id in list(self.clients):
-                await self._stop(instance_id)
+        # Cleanup must reconcile while the Discord clients, stores and organizer remain open.
+        try:
+            await self.cleanup.close()
+        finally:
+            async with self.registry_lock:
+                for instance_id in list(self.clients):
+                    await self._stop(instance_id)
+            await self.projects.close()

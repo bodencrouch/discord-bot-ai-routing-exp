@@ -169,6 +169,47 @@ class Dashboard:
                 }
             except (OSError, ValueError, KeyError):
                 instance["configuration"] = {}
+        project_snapshot = self.hub.projects.snapshot()
+        projects = []
+        for project in project_snapshot["projects"]:
+            rooms = [
+                room
+                for room in project_snapshot["rooms"]
+                if room["project_id"] == project["id"]
+            ]
+            evidence = [
+                entry
+                for entry in project_snapshot["evidence"]
+                if entry["project_id"] == project["id"]
+            ]
+            projects.append(
+                {
+                    **project,
+                    "rooms": [
+                        {
+                            "id": room["channel_id"],
+                            "title": room["channel_id"],
+                            "url": f"https://discord.com/channels/{project['guild_id']}/{room['channel_id']}",
+                        }
+                        for room in rooms
+                    ],
+                    "evidence": [
+                        {
+                            **entry,
+                            "url": entry.get("source_url"),
+                            "summary": entry["claim"],
+                        }
+                        for entry in evidence
+                    ],
+                    "uncertainty": project.get("data", {}).get("unresolved")
+                    or "Project membership is inferred from attributed source messages.",
+                    "reconstruction_source": {
+                        "model": "auto/fast",
+                        "skills": project_snapshot["skills"],
+                        "coverage": project_snapshot["coverage"],
+                    },
+                }
+            )
         return {
             "instances": instances,
             "presets": presets,
@@ -180,6 +221,15 @@ class Dashboard:
             "model_error": self.model_error,
             "jobs": self.jobs(),
             "conversations": self.conversations(),
+            "projects": projects,
+            "naming": {
+                item["id"]: {
+                    "enabled": True,
+                    "model": "auto/fast",
+                    "description": "Default-titled AI threads are named from their first meaningful prompt. Explicit member titles are preserved.",
+                }
+                for item in instances
+            },
             "analytics": {
                 **self.state.analytics(),
                 "event_counts_in_window": kinds,
@@ -193,6 +243,27 @@ class Dashboard:
         from .presets import PRESETS
 
         parts = path.strip("/").split("/")
+        if len(parts) == 3 and parts[:2] == ["api", "cleanup"]:
+            instance, guild_id = self.cleanup_instance(parts[2])
+            snapshot_id = data.get("snapshot_id")
+            if not isinstance(snapshot_id, str):
+                raise ValueError("Review a cleanup snapshot first.")
+            if instance.get("dry_run"):
+                return {
+                    "ok": True,
+                    "running": False,
+                    "result": {
+                        "dry_run": True,
+                        "message": "Dry-run cleanup preview recorded.",
+                    },
+                }
+            self.hub.cleanup.start(guild_id, "dashboard-owner", snapshot_id)
+            return {
+                "ok": True,
+                "running": True,
+                "status": "running",
+                "job_id": snapshot_id,
+            }
         if (
             len(parts) == 4
             and parts[:2] == ["api", "instances"]
@@ -512,6 +583,18 @@ class Dashboard:
                                 dashboard.get_state(), dashboard.loop
                             ).result(20),
                         )
+                    elif request.path.startswith("/api/cleanup/"):
+                        instance_id = unquote(
+                            request.path.removeprefix("/api/cleanup/")
+                        )
+                        refresh = parse_qs(request.query).get("refresh") == ["1"]
+                        self.reply(
+                            200,
+                            asyncio.run_coroutine_threadsafe(
+                                dashboard.get_cleanup(instance_id, refresh),
+                                dashboard.loop,
+                            ).result(90),
+                        )
                     elif request.path.startswith("/api/turns/"):
                         parts = request.path.strip("/").split("/")
                         if len(parts) != 4:
@@ -611,6 +694,22 @@ class Dashboard:
 
     async def get_state(self):
         return await asyncio.to_thread(self.snapshot)
+
+    def cleanup_instance(self, instance_id):
+        instance = next(
+            (item for item in self.state.instances() if item["id"] == instance_id), None
+        )
+        if not instance:
+            raise ValueError("Instance not found.")
+        settings = json.loads(Path(instance["config_file"]).read_text())
+        return instance, str(settings["guild_id"])
+
+    async def get_cleanup(self, instance_id, refresh=False):
+        _, guild_id = self.cleanup_instance(instance_id)
+        current = self.hub.cleanup.latest(guild_id)
+        if current and (not refresh or self.hub.cleanup.is_running(guild_id)):
+            return current
+        return await self.hub.cleanup.preview(guild_id)
 
     async def get_turn(self, instance_id, key):
         return await asyncio.to_thread(self.turn, instance_id, key)

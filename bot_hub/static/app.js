@@ -43,6 +43,8 @@ let advancedDirty = false;
 let reviewDirty = false;
 const expandedConversations = new Set();
 const expandedEvents = new Set();
+const cleanupStates = new Map();
+const cleanupTimers = new Map();
 const empty = (message) => `<div class="empty">${escapeHTML(message)}</div>`;
 const time = (date) => {
   const parsed = new Date(date);
@@ -91,12 +93,15 @@ async function api(path, body) {
   } catch {
     data = {};
   }
-  if (!response.ok)
-    throw new Error(
+  if (!response.ok) {
+    const error = new Error(
       response.status === 401
         ? "Your session needs authentication. Reopen the private dashboard link from the hub."
         : data.error || data.detail || `Request failed (${response.status}).`,
     );
+    error.details = data;
+    throw error;
+  }
   return data;
 }
 function isRunning(instance) {
@@ -581,6 +586,196 @@ function renderJobs() {
         .join("")
     : empty("No maintenance jobs have been recorded.");
 }
+function publicLink(url, label) {
+  if (typeof url !== "string" || !/^https?:\/\//.test(url)) return "";
+  return `<a href="${escapeHTML(url)}" target="_blank" rel="noopener noreferrer">${text(label)} ↗</a>`;
+}
+function projectRoom(room, guildId) {
+  if (typeof room !== "object" || room === null) room = { id: room };
+  const id = room.id || room.room || room.room_id;
+  const url =
+    room.url ||
+    (/^\d+$/.test(String(guildId)) && /^\d+$/.test(String(id))
+      ? `https://discord.com/channels/${guildId}/${id}`
+      : "");
+  const label = room.title || room.name || id || "Thread";
+  return `<li>${publicLink(url, label) || text(label)}${room.message_count != null ? ` <span class="quiet">· ${text(room.message_count)} messages</span>` : ""}</li>`;
+}
+function renderProjects() {
+  const owner = current()?.identity_instance || selected;
+  const guildId =
+    current()?.configuration?.guild_id ||
+    state.instances.find((item) => item.id === owner)?.configuration?.guild_id;
+  const projects = rows(state.projects).filter(
+    (item) =>
+      !item.instance_id ||
+      item.instance_id === selected ||
+      item.instance_id === owner,
+  );
+  $("#project-count").textContent = projects.length;
+  const query = $("#project-search").value.trim().toLowerCase();
+  const visible = projects.filter((item) =>
+    `${item.name || ""} ${item.summary || ""}`.toLowerCase().includes(query),
+  );
+  $("#projects-list").innerHTML = visible.length
+    ? visible
+        .map((item) => {
+          const rooms = rows(item.rooms || item.threads);
+          const evidence = rows(item.evidence);
+          return `<article class="panel project-card"><div class="panel-heading"><div><h3>${text(item.name || item.id || "Unnamed project")}</h3><p>${text(item.summary || "No project summary recorded.")}</p></div><span class="badge">Inferred group</span></div><div class="project-body"><p class="mono quiet">${rooms.length} threads · ${text(item.evidence_count ?? evidence.length)} evidence references</p><p class="quiet">${text(item.uncertainty || "Project membership is inferred and may need review.")}</p>${rooms.length ? `<h4>Threads</h4><ul>${rooms.map((room) => projectRoom(room, item.guild_id || guildId)).join("")}</ul>` : ""}${evidence.length ? `<details><summary>Evidence references</summary><ul>${evidence.map((entry) => `<li>${typeof entry === "object" && entry !== null ? publicLink(entry.url || entry.message_url, entry.summary || entry.label || entry.message_id || "Message evidence") || text(entry.summary || entry.label || entry.message_id || "Reference unavailable") : text(entry)}</li>`).join("")}</ul></details>` : ""}<h4>Reconstruction provenance</h4><pre>${text(item.reconstruction_source || "Reconstruction source unavailable.")}</pre><small class="quiet">Updated ${escapeHTML(dateTime(item.updated_at))}</small></div></article>`;
+        })
+        .join("")
+    : empty(
+        projects.length
+          ? "No projects match this search."
+          : "No reconstructed project groups are available yet.",
+      );
+  const configuration =
+    state.instances.find((item) => item.id === owner)?.configuration ||
+    current()?.configuration ||
+    {};
+  const naming =
+    state.naming?.[owner] || state.naming || configuration.thread_naming || {};
+  const enabled = naming.enabled ?? configuration.auto_thread_naming;
+  $("#naming-status").textContent =
+    enabled === true
+      ? "Enabled · new conversation threads use auto/fast"
+      : enabled === false
+        ? "Disabled"
+        : "Naming status unavailable";
+  $("#naming-detail").textContent =
+    naming.description ||
+    "Automatic names describe new conversation threads. Project grouping uses recorded evidence and inferred reconstruction.";
+}
+function renderCleanup() {
+  const local = cleanupStates.get(selected);
+  $("#review-cleanup").disabled =
+    !current() || !!local?.busy || !!local?.running;
+  if (!local) {
+    $("#cleanup-preview").innerHTML = "";
+    return;
+  }
+  const preview = local.preview || {};
+  const permissions = rows(preview.missing_permissions);
+  const permissionLinks = rows(preview.permission_urls)
+    .map((item) =>
+      publicLink(item.url, item.name || "Grant cleanup permissions"),
+    )
+    .filter(Boolean);
+  const readGaps = rows(preview.read_gaps);
+  const blocked =
+    permissions.length > 0 || readGaps.length > 0 || preview.blocked === true;
+  $("#cleanup-preview").innerHTML =
+    `${local.busy ? '<p class="quiet">Loading cleanup scope…</p>' : ""}${local.error ? `<p class="error">${text(local.error)}</p>` : ""}${preview.snapshot_id ? `<dl class="cleanup-scope"><div><dt>Guild</dt><dd>${text(preview.guild_id || "Unavailable")}</dd></div><div><dt>Scope</dt><dd>${text(preview.scope || "All guild messages and AI threads")}</dd></div><div><dt>Messages</dt><dd>${text(preview.message_count ?? "Unavailable")}</dd></div><div><dt>AI threads</dt><dd>${text(preview.thread_count ?? "Unavailable")}</dd></div></dl>` : ""}${permissions.length ? `<p class="error">Missing cleanup permissions ${text(permissions.join(", "))}</p>` : ""}${readGaps.length ? `<div class="error"><p>Cleanup is blocked because parts of the server could not be read.</p><ul>${readGaps.map((gap) => `<li>${text(gap)}</li>`).join("")}</ul></div>` : ""}${preview.blocked ? '<p class="error">The server blocked this cleanup preview.</p>' : ""}${permissionLinks.length ? `<div class="permission-links"><h3>Grant cleanup permissions</h3>${permissionLinks.join(" ")}</div>` : ""}${local.running ? '<p class="quiet" role="status">Cleanup is running. Progress refreshes automatically.</p>' : ""}${local.result ? `<details open><summary>Cleanup result</summary><pre>${text(local.result)}</pre></details>` : ""}${preview.snapshot_id && !blocked && !local.running && !local.result && !local.busy ? '<p class="cleanup-warning">The reviewed snapshot includes human messages. Deletion is permanent.</p><button class="danger-button" type="button" data-execute-cleanup>Clear server messages and AI threads</button>' : ""}`;
+}
+async function reviewCleanup(instanceId) {
+  cleanupStates.set(instanceId, { busy: true });
+  renderCleanup();
+  try {
+    const preview = await api(
+      `/api/cleanup/${encodeURIComponent(instanceId)}?refresh=1`,
+    );
+    const running =
+      preview.running === true ||
+      ["running", "queued", "in_progress"].includes(preview.status);
+    cleanupStates.set(instanceId, { preview, running, result: preview.result });
+    if (running && !cleanupTimers.has(instanceId))
+      cleanupTimers.set(
+        instanceId,
+        setTimeout(() => pollCleanup(instanceId), 3000),
+      );
+  } catch (error) {
+    cleanupStates.set(instanceId, {
+      error: error.message,
+      preview: error.details || {},
+    });
+  }
+  if (selected === instanceId) renderCleanup();
+}
+async function pollCleanup(instanceId) {
+  try {
+    const response = await api(
+      `/api/cleanup/${encodeURIComponent(instanceId)}`,
+    );
+    const running =
+      response.running === true ||
+      ["running", "queued", "in_progress"].includes(
+        response.status || response.state,
+      );
+    const local = cleanupStates.get(instanceId) || {};
+    cleanupStates.set(instanceId, {
+      ...local,
+      running,
+      result:
+        response.result ||
+        (running
+          ? {
+              status: response.status || response.state,
+              progress: response.progress,
+            }
+          : response),
+    });
+    if (running)
+      cleanupTimers.set(
+        instanceId,
+        setTimeout(() => pollCleanup(instanceId), 3000),
+      );
+    else {
+      cleanupTimers.delete(instanceId);
+      refresh();
+    }
+  } catch (error) {
+    cleanupStates.set(instanceId, {
+      ...cleanupStates.get(instanceId),
+      running: false,
+      error: error.message,
+    });
+  }
+  if (selected === instanceId) renderCleanup();
+}
+async function executeCleanup(instanceId) {
+  const local = cleanupStates.get(instanceId);
+  if (
+    !local?.preview?.snapshot_id ||
+    local.running ||
+    local.busy ||
+    local.preview.blocked ||
+    rows(local.preview.missing_permissions).length ||
+    rows(local.preview.read_gaps).length
+  )
+    return;
+  cleanupStates.set(instanceId, { ...local, running: true });
+  renderCleanup();
+  try {
+    const response = await api(
+      `/api/cleanup/${encodeURIComponent(instanceId)}`,
+      { snapshot_id: local.preview.snapshot_id },
+    );
+    const running =
+      response.running === true ||
+      ["running", "queued", "in_progress"].includes(
+        response.status || response.state,
+      );
+    cleanupStates.set(instanceId, {
+      ...local,
+      running,
+      result: response.result || response,
+    });
+    if (running)
+      cleanupTimers.set(
+        instanceId,
+        setTimeout(() => pollCleanup(instanceId), 3000),
+      );
+    else refresh();
+  } catch (error) {
+    cleanupStates.set(instanceId, {
+      ...local,
+      error: error.message,
+      result: error.details,
+    });
+  }
+  if (selected === instanceId) renderCleanup();
+}
 function render() {
   renderNavigation();
   const instance = current();
@@ -589,6 +784,8 @@ function render() {
   renderConfig(instance);
   renderJobs();
   renderConversations();
+  renderProjects();
+  renderCleanup();
   // Preserve unfinished review drafts during background refreshes.
   if (!reviewDirty && !$("#predictions").contains(document.activeElement))
     renderPredictions();
@@ -882,6 +1079,11 @@ window.addEventListener("beforeunload", (event) => {
     event.preventDefault();
     event.returnValue = "";
   }
+});
+$("#project-search").addEventListener("input", renderProjects);
+$("#review-cleanup").addEventListener("click", () => reviewCleanup(selected));
+$("#cleanup-preview").addEventListener("click", (event) => {
+  if (event.target.closest("[data-execute-cleanup]")) executeCleanup(selected);
 });
 $("#metrics").innerHTML = '<div class="skeleton"></div>'.repeat(4);
 refresh();

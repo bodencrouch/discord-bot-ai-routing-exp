@@ -1179,3 +1179,95 @@ dialog::backdrop {
   color: var(--danger);
   margin-top: 16px;
 }
+
+.naming-panel {
+  margin-bottom: 22px;
+}
+.project-card {
+  margin-bottom: 18px;
+}
+.project-card h3 {
+  margin: 0;
+  font-size: 16px;
+}
+.project-body,
+.cleanup-body {
+  padding: 0 22px 22px;
+  font-size: 12px;
+}
+.project-body h4 {
+  margin: 20px 0 10px;
+  font-size: 11px;
+  color: var(--muted);
+}
+.project-body ul {
+  padding-left: 18px;
+  line-height: 1.9;
+  overflow-wrap: anywhere;
+}
+.project-body a,
+.permission-links a {
+  color: var(--accent);
+}
+.project-body pre,
+#cleanup-preview pre {
+  font:
+    11px/1.7 "IBM Plex Mono",
+    monospace;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  max-height: 360px;
+  overflow: auto;
+}
+.project-body details summary,
+#cleanup-preview details summary {
+  cursor: pointer;
+  color: var(--muted);
+}
+.cleanup-card {
+  margin-top: 28px;
+}
+.cleanup-body > p,
+.cleanup-warning {
+  color: #e8b3a7;
+  font-size: 12px;
+  line-height: 1.8;
+}
+.cleanup-scope {
+  display: grid;
+  gap: 12px;
+  margin: 22px 0;
+}
+.cleanup-scope > div {
+  display: flex;
+  justify-content: space-between;
+  gap: 20px;
+}
+.cleanup-scope dt {
+  color: var(--muted);
+}
+.cleanup-scope dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+  text-align: right;
+}
+.permission-links {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 10px;
+  margin: 20px 0;
+}
+.permission-links h3 {
+  margin: 0;
+  font-size: 12px;
+}
+.danger-button {
+  background: #5d302c;
+  border-color: #a65f54;
+  color: #ffe1da;
+  white-space: normal;
+}
+.danger-button:hover {
+  background: #773d35;
+}

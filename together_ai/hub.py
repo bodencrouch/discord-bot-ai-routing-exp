@@ -79,6 +79,7 @@ class HubTogether(Together):
     def __init__(self, path, config, instance, state):
         self.instance, self.hub_state = instance, state
         self.turn_tasks = set()
+        self.project_observed_sources = set()
         super().__init__(path, config)
         self.tree.interaction_check = self.command_check
         original_tool = self.engine.call_tool
@@ -193,6 +194,12 @@ class HubTogether(Together):
             )
         )
 
+    def cleanup_running(self):
+        runtime = getattr(self, "hub_runtime", None)
+        return bool(
+            runtime and runtime.cleanup.is_running(str(self.config["guild_id"]))
+        )
+
     async def command_check(self, interaction):
         name = getattr(interaction.command, "qualified_name", "unknown")
         self.emit(
@@ -203,6 +210,18 @@ class HubTogether(Together):
                 "user_id": str(interaction.user.id),
             },
         )
+        utility = name in {"cleanup", "projects", "status"}
+        guild_matches = interaction.guild and str(interaction.guild.id) == str(
+            self.config["guild_id"]
+        )
+        if utility and guild_matches:
+            return True
+        if self.cleanup_running():
+            await interaction.response.send_message(
+                "Server cleanup is in progress. Try again when it finishes.",
+                ephemeral=True,
+            )
+            return False
         if not self.allowed(interaction.channel):
             await interaction.response.send_message(
                 "This instance is scoped to its configured channels.", ephemeral=True
@@ -225,10 +244,26 @@ class HubTogether(Together):
         self.emit("connection.disconnected", {})
 
     async def on_message(self, message):
+        if self.cleanup_running():
+            return
         if getattr(self, "hub_runtime", None):
             self.hub_runtime.dispatch_components(self.instance["id"], message)
         if message.author.bot or not self.allowed(message.channel):
             return
+        excluded = {str(value) for value in self.config.get("excluded_channels", [])}
+        if (
+            str(message.channel.id) in excluded
+            or str(getattr(message.channel, "parent_id", "")) in excluded
+        ):
+            return
+        if getattr(self, "hub_runtime", None):
+            await self.hub_runtime.observe_discord_message(self, message)
+            self.project_observed_sources.add(message.id)
+            if len(self.project_observed_sources) > 2000:
+                self.project_observed_sources = {message.id}
+            self.hub_runtime.name_new_thread(
+                self, message.channel.id, self.hub_runtime.observation_content(message)
+            )
         self.emit(
             "message.received",
             {
@@ -259,6 +294,30 @@ class HubTogether(Together):
             return
         await super().on_message(message)
 
+    async def create_conversation(
+        self, channel, title, author, participants=(), model=None
+    ):
+        thread = await super().create_conversation(
+            channel, title, author, participants, model
+        )
+        if (
+            getattr(self, "hub_runtime", None)
+            and thread.id != channel.id
+            and (not title or title == "AI conversation")
+        ):
+            self.hub_runtime.remember_thread(self, thread)
+        return thread
+
+    async def render_turn(self, key, model, answer, raw, **kwargs):
+        if self.cleanup_running():
+            raise asyncio.CancelledError()
+        output = await super().render_turn(key, model, answer, raw, **kwargs)
+        if getattr(self, "hub_runtime", None) and isinstance(raw, list) and output:
+            await self.hub_runtime.observe_message(
+                self, output.channel, output.id, self.user, answer, role="assistant"
+            )
+        return output
+
     async def run_turn(
         self,
         channel,
@@ -272,8 +331,19 @@ class HubTogether(Together):
         ambient=False,
         anchor_id=None,
     ):
-        if not self.allowed(channel):
+        if self.cleanup_running() or not self.allowed(channel):
             return None
+        if getattr(self, "hub_runtime", None):
+            if not source_id or int(source_id) not in self.project_observed_sources:
+                await self.hub_runtime.observe_message(
+                    self,
+                    channel,
+                    source_id or anchor_id,
+                    author,
+                    prompt,
+                    kind="message" if source_id else "command",
+                )
+            self.hub_runtime.name_new_thread(self, channel.id, prompt)
         self.turn_tasks.add(asyncio.current_task())
         self.emit(
             "turn.requested",
@@ -322,7 +392,18 @@ class HubTogether(Together):
                                 io.BytesIO(answer.encode()), filename="draft.md"
                             )
                         )
-                    await send(content=content, view=view, files=files)
+                    if self.cleanup_running():
+                        raise asyncio.CancelledError()
+                    output = await send(content=content, view=view, files=files)
+                    if getattr(self, "hub_runtime", None) and output:
+                        await self.hub_runtime.observe_message(
+                            self,
+                            channel,
+                            output.id,
+                            self.user,
+                            answer,
+                            role="assistant",
+                        )
                     return {"id": draft_id, "dry_run": True, "answer": answer}
             result = await super().run_turn(
                 channel,
@@ -350,6 +431,8 @@ class HubTogether(Together):
     async def revise_turn(
         self, key, actor, prompt=None, model=None, expected_version=None
     ):
+        if self.cleanup_running():
+            return None
         if self.instance.get("dry_run"):
             raise ValueError(
                 "Turn revisions are unavailable while this instance is in dry-run mode."
@@ -357,9 +440,21 @@ class HubTogether(Together):
         task = asyncio.current_task()
         self.turn_tasks.add(task)
         try:
-            return await super().revise_turn(
+            channel = await super().revise_turn(
                 key, actor, prompt, model, expected_version
             )
+            if prompt is not None and getattr(self, "hub_runtime", None):
+                turn = self.store.turn(key)
+                if turn:
+                    await self.hub_runtime.observe_message(
+                        self,
+                        channel,
+                        turn.get("source_id") or turn.get("anchor_id"),
+                        actor,
+                        prompt,
+                        kind="edit",
+                    )
+            return channel
         except asyncio.CancelledError:
             if self.store.turn(key):
                 self.store.fail_turn(key)
@@ -377,16 +472,63 @@ class HubTogether(Together):
         await super().close()
 
     async def on_raw_message_edit(self, event):
-        if self.instance.get("dry_run"):
+        if self.cleanup_running():
             return
-        channel = self.get_channel(event.channel_id)
-        if self.allowed(channel):
-            await super().on_raw_message_edit(event)
+        try:
+            if not self.instance.get("dry_run"):
+                channel = self.get_channel(event.channel_id)
+                if self.allowed(channel):
+                    await super().on_raw_message_edit(event)
+        finally:
+            if getattr(self, "hub_runtime", None):
+                await self.hub_runtime.observe_edited_message(self, event)
 
     async def on_raw_message_delete(self, event):
-        if not self.instance.get("dry_run"):
-            await super().on_raw_message_delete(event)
+        if self.cleanup_running():
+            return
+        try:
+            if not self.instance.get("dry_run"):
+                await super().on_raw_message_delete(event)
+        finally:
+            if getattr(self, "hub_runtime", None) and str(
+                getattr(event, "guild_id", "")
+            ) == str(self.config["guild_id"]):
+                await self.hub_runtime.remove_project_sources(
+                    self, message_ids=[event.message_id]
+                )
 
     async def on_raw_bulk_message_delete(self, event):
-        if not self.instance.get("dry_run"):
-            await super().on_raw_bulk_message_delete(event)
+        if self.cleanup_running():
+            return
+        try:
+            if not self.instance.get("dry_run"):
+                await super().on_raw_bulk_message_delete(event)
+        finally:
+            if getattr(self, "hub_runtime", None) and str(
+                getattr(event, "guild_id", "")
+            ) == str(self.config["guild_id"]):
+                await self.hub_runtime.remove_project_sources(
+                    self, message_ids=event.message_ids
+                )
+
+    async def on_thread_delete(self, thread):
+        if (
+            not self.cleanup_running()
+            and getattr(self, "hub_runtime", None)
+            and self.hub_runtime.project_channel_allowed(self, thread)
+        ):
+            await self.hub_runtime.remove_project_sources(self, thread_ids=[thread.id])
+
+    async def on_raw_thread_delete(self, event):
+        if (
+            not self.cleanup_running()
+            and getattr(self, "hub_runtime", None)
+            and str(event.guild_id) == str(self.config["guild_id"])
+        ):
+            excluded = {
+                str(value) for value in self.config.get("excluded_channels", [])
+            }
+            if str(event.parent_id) not in excluded:
+                await self.hub_runtime.remove_project_sources(
+                    self, thread_ids=[event.thread_id]
+                )

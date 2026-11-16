@@ -74,6 +74,8 @@
             Conversations <span id="conversation-count">0</span></button
           ><button data-tab="predictions">
             Predictions & reviews <span id="prediction-count">0</span></button
+          ><button data-tab="projects">
+            Projects <span id="project-count">0</span></button
           ><button data-tab="configuration">Configuration</button
           ><button data-tab="maintenance">Maintenance</button>
         </nav>
@@ -258,6 +260,34 @@
             </section>
           </div>
         </section>
+        <section id="projects" class="tab-panel" hidden>
+          <div class="section-heading">
+            <div>
+              <h2>Projects</h2>
+              <p>
+                Inferred project groups with thread evidence and reconstruction
+                provenance.
+              </p>
+            </div>
+            <label class="filter-label"
+              >Find project<input
+                id="project-search"
+                type="search"
+                placeholder="Search name or summary"
+            /></label>
+          </div>
+          <section class="panel naming-panel">
+            <div class="panel-heading">
+              <div>
+                <h2>Automatic thread naming</h2>
+                <p id="naming-status">Status unavailable</p>
+              </div>
+              <span class="badge">auto/fast</span>
+            </div>
+            <p class="detail-body" id="naming-detail"></p>
+          </section>
+          <div id="projects-list"></div>
+        </section>
         <section id="maintenance" class="tab-panel" hidden>
           <div class="section-heading">
             <div>
@@ -266,6 +296,22 @@
             </div>
           </div>
           <div id="jobs-list"></div>
+          <section class="panel cleanup-card">
+            <div class="panel-heading">
+              <div>
+                <h2>Server cleanup</h2>
+                <p>Remove all guild messages and AI conversation threads.</p>
+              </div>
+            </div>
+            <div class="cleanup-body">
+              <p>
+                This permanently deletes ALL guild messages, including human
+                messages, and AI threads. This action is irreversible.
+              </p>
+              <button id="review-cleanup" type="button">Review cleanup</button>
+              <div id="cleanup-preview" aria-live="polite"></div>
+            </div>
+          </section>
         </section>
         <footer>
           <span

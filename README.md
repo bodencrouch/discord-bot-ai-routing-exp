@@ -6,6 +6,16 @@ Run `python -m bot_hub --config /absolute/private/hub.json`, or use `bot-hub.ser
 
 The dashboard shows live connection state, conversation history, model and tool activity, maintenance proposals, prediction feedback and session exports. Activity charts reflect recorded events. Existing conversation and maintenance SQLite history is reused. New telemetry is retained in the hub database. Source archives and the private learning index stay outside the repository.
 
+## Cleanup, projects and automatic thread names
+
+Both Discord identities expose `/status`, `/cleanup` and `/projects`. Status includes a cleanup button. A server administrator can review a snapshot, then confirm clearing its server messages and managed AI threads. The snapshot includes members’ messages. Newer conversation activity is preserved. The dashboard exposes the same review and execution controls to its authenticated operator. Dry-run instances retain preview behavior.
+
+The permission button opens Discord’s authorization page with the bot selected for this server. Discord must grant Manage Messages and Manage Threads before full cleanup can run. Channel overrides and inaccessible private history appear in the review. The bot cannot grant itself permissions. Thread-starter and membership system entries disappear when their thread is deleted.
+
+Project organization uses the installed Thought Reconstruction skill, its evidence contract and Protect Your Energy’s sustain-momentum guidance. Source paths and hashes are retained with the inferred groups. The classifier recovers purpose, relationships, corrections and uncertainty from current server activity. It uses `auto/fast`, considers bounded recent context and project candidates, and requires attributed human evidence. Message edits and deletions invalidate affected evidence. Historical archive data remains in the separate predictor workflow. Project groups and source links appear in `/projects` and the dashboard.
+
+Default-titled chat threads receive a coherent name from `auto/fast` after their first meaningful prompt. New maintenance threads use the same naming route with their issue number retained. Explicit user-supplied titles take precedence. Failed inference leaves an explicit naming failure in activity records. These features require the installed Thought Reconstruction and Protect Your Energy guidance on the bot host.
+
 ## Prediction and review
 
 Reply Guy defaults to dry-run with the `auto/fast` route. Skill Issue Department uses `auto/best-free`. It posts a labelled proposed follow-up with Helpful, Missed, Edit and Review controls. Votes, edited drafts and reviews persist and inform later predictions. A subsequent message from the configured owner is compared with the original prediction by intent and constraints. A semantic score of at least 0.8 marks an estimated match. The predictor configuration can override this with `semantic_threshold`. Lexical fallback is labelled separately and establishes equivalence only for normalized exact text. These are uncalibrated estimates, and human reviews remain visible alongside them.
