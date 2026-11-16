@@ -1,7 +1,9 @@
 import asyncio
+import base64
 import io
 import json
 import logging
+import mimetypes
 import os
 import re
 import sqlite3
@@ -10,6 +12,7 @@ from pathlib import Path
 import discord
 
 from .changes import Changes, StaleProposal
+from .recovery import SessionStore, rewind_activity
 
 
 class EditRequest(discord.ui.Modal, title="Refine the skill issue"):
@@ -114,10 +117,35 @@ class RequestButton(
         elif self.action == "retry" and job["state"] == "failed":
             bot.update(
                 self.job,
-                state="queued",
+                state="rewinding",
                 version=self.version + 1,
                 note="Queued for another planning attempt.",
             )
+            if interaction.message:
+                try:
+                    await interaction.message.edit(view=None)
+                except discord.NotFound:
+                    pass
+            checkpoint = bot.sessions.load(self.job)
+            marker = (
+                checkpoint.get("activity_message_id")
+                if checkpoint
+                else str(job["source"])
+            )
+            try:
+                await rewind_activity(bot, self.job, marker)
+            except discord.HTTPException as error:
+                bot.update(
+                    self.job,
+                    state="failed",
+                    note=f"Retry could not rewind the later bot output (Discord HTTP {error.status}).",
+                )
+                await bot.card(self.job)
+                await bot.progress(
+                    self.job, "Request failed: " + bot.get(self.job)["note"]
+                )
+                return
+            bot.update(self.job, state="queued")
         await bot.card(self.job)
         await bot.progress(
             self.job,
@@ -150,10 +178,16 @@ class Parent(discord.Client):
             row[1] for row in self.db.execute("PRAGMA table_info(jobs)")
         }:
             self.db.execute("ALTER TABLE jobs ADD COLUMN thread_card INTEGER")
+        if "failure_message" not in {
+            row[1] for row in self.db.execute("PRAGMA table_info(jobs)")
+        }:
+            self.db.execute("ALTER TABLE jobs ADD COLUMN failure_message TEXT")
         self.db.execute(
             "CREATE TABLE IF NOT EXISTS audit (id INTEGER PRIMARY KEY AUTOINCREMENT, job INTEGER, snapshot TEXT, recorded_at TEXT DEFAULT CURRENT_TIMESTAMP)"
         )
         self.db.commit()
+        self.sessions = SessionStore(config["database"])
+        self.activity_messages = {}
         self.wake = asyncio.Event()
         self.worker = None
         self.active_jobs = {}
@@ -214,7 +248,38 @@ class Parent(discord.Client):
                 await self.card(job["id"], attach=True)
             except discord.HTTPException:
                 logging.exception("Could not restore thread review card")
+        for job in self.db.execute(
+            "SELECT * FROM jobs WHERE state='rewinding'"
+        ).fetchall():
+            saved = self.sessions.load(job["id"])
+            marker = saved.get("activity_message_id") if saved else str(job["source"])
+            try:
+                await rewind_activity(self, job["id"], marker)
+                self.update(job["id"], state="queued")
+            except discord.HTTPException:
+                self.update(
+                    job["id"],
+                    state="failed",
+                    note="Interrupted retry could not finish rewinding Discord activity.",
+                )
         self.wake.set()
+
+        for job in self.db.execute(
+            "SELECT * FROM jobs WHERE state='failed' AND thread IS NOT NULL"
+        ).fetchall():
+            thread = self.get_channel(job["thread"])
+            if thread is None:
+                continue
+            view = discord.ui.View(timeout=None)
+            view.add_item(RequestButton(job["id"], job["version"], "retry"))
+            try:
+                if job["failure_message"]:
+                    message = await thread.fetch_message(int(job["failure_message"]))
+                    await message.edit(view=view)
+                else:
+                    await self.progress(job["id"], "Request failed: " + job["note"])
+            except discord.NotFound:
+                await self.progress(job["id"], "Request failed: " + job["note"])
 
     async def close(self):
         if self.worker:
@@ -227,6 +292,7 @@ class Parent(discord.Client):
             task.cancel()
         await asyncio.gather(*self.active_jobs.values(), return_exceptions=True)
         await self.changes.http.aclose()
+        self.sessions.close()
         self.db.close()
         await super().close()
 
@@ -241,15 +307,23 @@ class Parent(discord.Client):
             if thread.archived:
                 await thread.edit(archived=False)
             content = f"**Activity · #{job_id}** {message}"
+            view = None
+            if job["state"] == "failed" and message.startswith("Request failed:"):
+                view = discord.ui.View(timeout=None)
+                view.add_item(RequestButton(job_id, job["version"], "retry"))
             if len(content) <= 1900:
-                await thread.send(content)
+                sent = await thread.send(content, view=view)
             else:
-                await thread.send(
+                sent = await thread.send(
                     f"**Activity · #{job_id}** Full model or tool output attached.",
                     file=discord.File(
                         io.BytesIO(message.encode()), filename="activity.txt"
                     ),
+                    view=view,
                 )
+            self.activity_messages[job_id] = str(sent.id)
+            if view is not None:
+                self.update(job_id, failure_message=str(sent.id))
         except discord.HTTPException:
             logging.exception("Could not post request activity")
 
@@ -509,6 +583,98 @@ class Parent(discord.Client):
         self.active_jobs.pop(job_id, None)
         self.wake.set()
 
+    async def request_context(self, job):
+        """Resolve the request's live Discord context and actual image bytes."""
+        thread = self.get_channel(job["thread"]) or await self.fetch_channel(
+            job["thread"]
+        )
+        parent = getattr(thread, "parent", None) or thread
+        messages = {}
+        errors = []
+        try:
+            source = await parent.fetch_message(int(job["source"]))
+            messages[source.id] = source
+            async for message in parent.history(limit=30, before=source):
+                if not message.author.bot:
+                    messages[message.id] = message
+        except discord.HTTPException as error:
+            errors.append({"source_id": str(job["source"]), "status": error.status})
+        async for message in thread.history(limit=40):
+            if not message.author.bot:
+                messages[message.id] = message
+        links = re.findall(
+            r"https?://(?:www\.)?discord\.com/channels/(\d+)/(\d+)/(\d+)",
+            job["request"],
+        )
+        for guild_id, channel_id, message_id in links:
+            if int(guild_id) != int(self.config["guild_id"]):
+                continue
+            try:
+                channel = self.get_channel(int(channel_id)) or await self.fetch_channel(
+                    int(channel_id)
+                )
+                message = await channel.fetch_message(int(message_id))
+                messages[message.id] = message
+            except discord.HTTPException as error:
+                errors.append({"source_id": message_id, "status": error.status})
+        context = {"messages": [], "images": [], "retrieval_errors": errors}
+        image_sources = []
+        for message in sorted(messages.values(), key=lambda item: item.id):
+            context["messages"].append(
+                {
+                    "source_id": str(message.id),
+                    "author": message.author.display_name,
+                    "role": "human",
+                    "content": message.content[:4000],
+                }
+            )
+            for attachment in message.attachments:
+                mime = (
+                    attachment.content_type
+                    or mimetypes.guess_type(attachment.filename)[0]
+                    or ""
+                )
+                if mime.split(";")[0] not in {
+                    "image/png",
+                    "image/jpeg",
+                    "image/webp",
+                    "image/gif",
+                }:
+                    continue
+                if attachment.size > 8_000_000:
+                    errors.append(
+                        {
+                            "source_id": str(message.id),
+                            "file": attachment.filename,
+                            "reason": "Image exceeds the inference upload budget",
+                        }
+                    )
+                    continue
+                try:
+                    raw = await attachment.read()
+                    context["images"].append(
+                        {
+                            "url": "data:"
+                            + mime.split(";")[0]
+                            + ";base64,"
+                            + base64.b64encode(raw).decode()
+                        }
+                    )
+                    image_sources.append(str(message.id))
+                except discord.HTTPException as error:
+                    errors.append(
+                        {
+                            "source_id": str(message.id),
+                            "file": attachment.filename,
+                            "status": error.status,
+                        }
+                    )
+        await self.progress(
+            job["id"],
+            f"Retrieved {len(context['messages'])} live Discord context messages and {len(context['images'])} image attachments. Image source messages: {', '.join(image_sources) or 'none'}. {len(errors)} retrieval errors.",
+        )
+        return context
+
     async def process_job(self, job_id):
         job = self.get(job_id)
         if not job or job["state"] not in {"queued", "approved"}:
@@ -532,8 +698,24 @@ class Parent(discord.Client):
                 note="Reading the current implementation and running protecting-your-energy.",
             )
             await self.card(job_id)
+            context = await self.request_context(job)
+            resume = self.sessions.load(job_id)
+
+            async def checkpoint(state):
+                await asyncio.to_thread(
+                    self.sessions.save,
+                    job_id,
+                    state,
+                    self.activity_messages.get(job_id),
+                )
+
             proposal = await self.changes.propose(
-                job["request"], job_id, lambda message: self.progress(job_id, message)
+                job["request"],
+                job_id,
+                lambda message: self.progress(job_id, message),
+                context=context,
+                resume=resume["state"] if resume else None,
+                checkpoint=checkpoint,
             )
             if (
                 self.get(job_id)["version"] != version

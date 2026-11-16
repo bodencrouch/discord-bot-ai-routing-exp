@@ -922,6 +922,9 @@ class Runtime:
         root = Path(__file__).resolve().parents[1]
         await self._command("uv", "sync", "--project", str(root))
         await self._command("systemctl", "--user", "daemon-reload")
+        from .cleanup import CleanupButton as previous_cleanup_button
+
+        await self.cleanup.close()
         async with self.registry_lock:
             for instance in instances:
                 await self._stop(instance["id"])
@@ -931,12 +934,24 @@ class Runtime:
                 "together_ai.routing",
                 "together_ai.conversations",
                 "together_ai.bot",
+                "together_ai.cleanup",
+                "bot_hub.cleanup",
                 "together_ai.hub",
             ):
                 importlib.reload(importlib.import_module(module_name))
             child_module = importlib.import_module("together_ai.hub")
             HubTogether = child_module.HubTogether
             telemetry_value = child_module.telemetry_value
+            cleanup_module = importlib.import_module("bot_hub.cleanup")
+            self.cleanup = cleanup_module.CleanupManager(self, self.state)
+            for instance_id, client in self.clients.items():
+                if instance_id in self.component_hosts or not hasattr(client, "tree"):
+                    continue
+                client.remove_dynamic_items(previous_cleanup_button)
+                self.install_commands(client)
+                guild = discord.Object(id=int(client.config["guild_id"]))
+                client.tree.copy_global_to(guild=guild)
+                await client.tree.sync(guild=guild)
         for instance in instances:
             await self.apply(instance["id"])
         for instance in instances:
