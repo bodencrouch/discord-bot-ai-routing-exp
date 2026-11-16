@@ -334,6 +334,20 @@ class Parent(discord.Client):
                 + " WHERE id=?",
                 (*fields.values(), job_id),
             )
+        if (
+            previous
+            and previous["state"] in {"planning", "queued", "rewinding"}
+            and fields.get("version", previous["version"]) != previous["version"]
+            and fields.get("state", previous["state"]) != "applying"
+        ):
+            active = self.active_jobs.get(job_id)
+            if active and not active.done():
+                try:
+                    current = asyncio.current_task()
+                except RuntimeError:
+                    current = None
+                if active is not current:
+                    active.cancel()
 
     def allowed(self, channel):
         return (

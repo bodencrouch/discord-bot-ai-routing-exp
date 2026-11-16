@@ -3,6 +3,7 @@ import base64
 import difflib
 import hashlib
 import json
+import math
 import os
 import random
 import re
@@ -208,8 +209,24 @@ def normalize_chat_response(response):
 class PlanningHTTPClient(httpx.AsyncClient):
     """Read planning SSE to its terminal event, independently of socket EOF."""
 
+    @staticmethod
+    def positive_timeout(value, default):
+        if isinstance(value, bool):
+            return default
+        try:
+            seconds = float(value)
+        except (TypeError, ValueError, OverflowError):
+            return default
+        return seconds if math.isfinite(seconds) and seconds > 0 else default
+
     async def post(self, url, **kwargs):
         progress = kwargs.pop("planning_progress", None)
+        first_output_timeout = self.positive_timeout(
+            kwargs.pop("planning_first_output_timeout", 90), 90
+        )
+        turn_timeout = self.positive_timeout(
+            kwargs.pop("planning_turn_timeout", 240), 240
+        )
         body = kwargs.get("json")
         if not isinstance(body, dict) or not body.get("stream"):
             return await super().post(url, **kwargs)
@@ -250,12 +267,18 @@ class PlanningHTTPClient(httpx.AsyncClient):
             for choice in chunk.get("choices", []) or []:
                 if not isinstance(choice, dict):
                     continue
-                delta = choice.get("delta") or {}
+                delta = choice.get("delta") or choice.get("message") or {}
                 if not isinstance(delta, dict):
                     continue
                 content = delta.get("content")
                 if isinstance(content, str):
                     stats["visible_chars"] += len(content)
+                elif isinstance(content, list):
+                    stats["visible_chars"] += sum(
+                        len(part["text"])
+                        for part in content
+                        if isinstance(part, dict) and isinstance(part.get("text"), str)
+                    )
                 for position, tool in enumerate(delta.get("tool_calls") or []):
                     function = tool.get("function") or {}
                     key = (choice.get("index", 0), tool.get("index", position))
@@ -267,44 +290,63 @@ class PlanningHTTPClient(httpx.AsyncClient):
                         stats["tool_argument_chars"] += len(function["arguments"])
 
         try:
-            async with self.stream("POST", url, **kwargs) as response:
-                if (
-                    not response.is_success
-                    or "text/event-stream"
-                    not in response.headers.get("content-type", "").lower()
+            try:
+                async with (
+                    asyncio.timeout(turn_timeout),
+                    asyncio.timeout(first_output_timeout) as first_deadline,
                 ):
-                    await response.aread()
-                    return response
-                await report(
-                    "Planning stream connected. Waiting for visible model output."
+                    async with self.stream("POST", url, **kwargs) as response:
+                        if (
+                            not response.is_success
+                            or "text/event-stream"
+                            not in response.headers.get("content-type", "").lower()
+                        ):
+                            await response.aread()
+                            return response
+                        await report(
+                            "Planning stream connected. Waiting for visible model output."
+                        )
+                        if progress:
+                            heartbeat = asyncio.create_task(pulse())
+                        lines, event_data = [], []
+                        async for line in response.aiter_lines():
+                            lines.append(line)
+                            if line.startswith("data:"):
+                                data = line[5:].strip()
+                                if data == "[DONE]":
+                                    lines.append("")
+                                    break
+                                event_data.append(line[5:].lstrip(" "))
+                            elif not line and event_data:
+                                inspect_event("\n".join(event_data))
+                                if (
+                                    stats["visible_chars"]
+                                    or stats["tool_argument_chars"]
+                                ):
+                                    first_deadline.reschedule(None)
+                                event_data.clear()
+                        headers = {
+                            key: value
+                            for key, value in response.headers.items()
+                            if key.lower() not in {"content-length", "content-encoding"}
+                        }
+                        buffered = httpx.Response(
+                            response.status_code,
+                            headers=headers,
+                            text="\n".join(lines),
+                            request=response.request,
+                            extensions=response.extensions,
+                        )
+                        normalized = normalize_chat_response(buffered)
+            except TimeoutError as error:
+                reason = (
+                    f"no visible output within {first_output_timeout:g} seconds"
+                    if first_deadline.expired()
+                    else f"turn exceeded {turn_timeout:g} seconds"
                 )
-                if progress:
-                    heartbeat = asyncio.create_task(pulse())
-                lines, event_data = [], []
-                async for line in response.aiter_lines():
-                    lines.append(line)
-                    if line.startswith("data:"):
-                        data = line[5:].strip()
-                        if data == "[DONE]":
-                            lines.append("")
-                            break
-                        event_data.append(line[5:].lstrip(" "))
-                    elif not line and event_data:
-                        inspect_event("\n".join(event_data))
-                        event_data.clear()
-                headers = {
-                    key: value
-                    for key, value in response.headers.items()
-                    if key.lower() not in {"content-length", "content-encoding"}
-                }
-                buffered = httpx.Response(
-                    response.status_code,
-                    headers=headers,
-                    text="\n".join(lines),
-                    request=response.request,
-                    extensions=response.extensions,
-                )
-                normalized = normalize_chat_response(buffered)
+                raise httpx.ReadTimeout(
+                    "Planning stream deadline exceeded: " + reason
+                ) from error
             payload = normalized.json()
             reasons = [
                 choice.get("finish_reason") for choice in payload.get("choices", [])
@@ -367,6 +409,12 @@ class Changes:
         for key in ("PARENT_CONFIG", "BOT_HUB_CONFIG"):
             if os.environ.get(key):
                 self.private_paths.add((self.root / os.environ[key]).resolve())
+        self.planning_first_output_timeout = PlanningHTTPClient.positive_timeout(
+            config.get("planning_first_output_timeout"), 90
+        )
+        self.planning_turn_timeout = PlanningHTTPClient.positive_timeout(
+            config.get("planning_turn_timeout"), 240
+        )
         self.http = PlanningHTTPClient(timeout=240)
 
     def snapshot(self):
@@ -1067,6 +1115,8 @@ Use the most recent follow-up as the user's current intent. Be concise and light
                         headers=headers,
                         json=body,
                         planning_progress=emit,
+                        planning_first_output_timeout=self.planning_first_output_timeout,
+                        planning_turn_timeout=self.planning_turn_timeout,
                     )
                     response = normalize_chat_response(response)
                 except httpx.TransportError as error:
