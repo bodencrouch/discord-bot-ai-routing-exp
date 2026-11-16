@@ -391,6 +391,13 @@ class Engine:
         ]
         self.models = [m["id"] for m in self.catalog]
 
+    def media_models(self, kind):
+        return [
+            model["id"]
+            for model in self.catalog
+            if model.get("type") == kind or kind in model.get("output_modalities", [])
+        ]
+
     def resolve_model(self, model):
         resolved = self.config.get("aliases", {}).get(model, model)
         if resolved not in self.models:
@@ -597,6 +604,15 @@ class Engine:
                 f"Choose a {kind} route in the model option. A default can also be configured with the terminal media command."
             )
         selected = self.config.get("aliases", {}).get(route, route)
+        metadata = next((m for m in self.catalog if m["id"] == selected), None)
+        if (
+            metadata
+            and metadata.get("type") in {"image", "video"}
+            and selected not in self.media_models(kind)
+        ):
+            raise ValueError(
+                f"That route produces {metadata['type']}. Choose a {kind} route."
+            )
         if not prompt.strip() or len(prompt) > 24000:
             raise ValueError("Include a prompt under 24,000 characters.")
         endpoint = "/images/generations" if kind == "image" else "/videos/generations"
@@ -606,6 +622,11 @@ class Engine:
             timeout=600,
         )
         if not response.is_success:
+            if response.status_code in {401, 403}:
+                raise RuntimeError(
+                    f"The {kind} route requires valid provider authentication and route access in OmniRoute. "
+                    "Reconnect the provider or choose another route."
+                )
             raise RuntimeError(
                 f"The {kind} route returned HTTP {response.status_code}. Check that this generation route is connected in OmniRoute."
             )

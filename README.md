@@ -65,7 +65,7 @@ systemctl --user restart together-ai
 
 The running bot loads configuration at startup. Discord route changes take effect immediately. CLI configuration changes take effect after restarting the service. Channel route choices are persisted in SQLite.
 
-Image and video commands call the gateway's `/v1/images/generations` and `/v1/videos/generations` endpoints. Choose a route explicitly or configure a default with the CLI. Generation requests are submitted once and can wait up to ten minutes for a gateway result. The bot displays returned image URLs, video URLs and base64 media, with raw JSON available behind its button. A connected compatible generation provider is required. Large media is subject to the Discord server's upload limit.
+Image and video commands call the gateway's `/v1/images/generations` and `/v1/videos/generations` endpoints. Autocomplete suggests routes with the matching media capability. Choose a route explicitly or configure a default with the CLI. The current installation uses the verified `antigravity/gemini-3.1-flash-image` image route by default. Video generation still requires a working authenticated provider. Generation requests are submitted once and can wait up to ten minutes for a gateway result. The bot displays returned image URLs, video URLs and base64 media, with raw JSON available behind its button. A connected compatible generation provider is required. Large media is subject to the Discord server's upload limit.
 
 ## Install on another host
 

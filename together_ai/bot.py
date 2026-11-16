@@ -550,6 +550,14 @@ class Together(discord.Client):
                     )
                     continue
                 extension = item.get("format", "png" if kind == "image" else "mp4")
+                if data.startswith(b"\xff\xd8\xff"):
+                    extension = "jpg"
+                elif data.startswith(b"\x89PNG\r\n\x1a\n"):
+                    extension = "png"
+                elif data.startswith((b"GIF87a", b"GIF89a")):
+                    extension = "gif"
+                elif data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+                    extension = "webp"
                 if extension not in {
                     "png",
                     "jpg",
@@ -711,6 +719,20 @@ class Together(discord.Client):
                 app_commands.Choice(name=v[:100], value=v)
                 for v in values
                 if current.lower() in v.lower() and len(v) <= 100
+            ][:25]
+
+        async def media_autocomplete(interaction, current):
+            kind = interaction.command.name
+            models = engine.media_models(kind)
+            aliases = [
+                alias
+                for alias, route in self.config.get("aliases", {}).items()
+                if route in models
+            ]
+            return [
+                app_commands.Choice(name=value[:100], value=value)
+                for value in aliases + models
+                if current.lower() in value.lower() and len(value) <= 100
             ][:25]
 
         async def skill_autocomplete(interaction, current):
@@ -890,7 +912,7 @@ class Together(discord.Client):
             name="image",
             description="Generate an image through a connected OmniRoute image route",
         )
-        @app_commands.autocomplete(model=autocomplete)
+        @app_commands.autocomplete(model=media_autocomplete)
         async def image(i: discord.Interaction, prompt: str, model: str = None):
             await self.generate_media(i, "image", prompt, model)
 
@@ -898,7 +920,7 @@ class Together(discord.Client):
             name="video",
             description="Generate a video through a connected OmniRoute video route",
         )
-        @app_commands.autocomplete(model=autocomplete)
+        @app_commands.autocomplete(model=media_autocomplete)
         async def video(i: discord.Interaction, prompt: str, model: str = None):
             await self.generate_media(i, "video", prompt, model)
 
