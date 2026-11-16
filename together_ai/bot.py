@@ -597,6 +597,12 @@ class Together(discord.Client):
         await interaction.followup.send(summary, view=self.response_view(key))
 
     async def on_message(self, message):
+        excluded = {int(value) for value in self.config.get("excluded_channels", [])}
+        if (
+            message.channel.id in excluded
+            or getattr(message.channel, "parent_id", None) in excluded
+        ):
+            return
         if (
             message.author.bot
             or not message.guild

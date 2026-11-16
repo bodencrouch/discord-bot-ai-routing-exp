@@ -91,3 +91,15 @@ systemctl --user restart together-ai
 ```
 
 The bot runs on this computer. Its availability depends on this computer and the configured gateway being online. Exa provides web search and fetching through its hosted MCP service. Its anonymous service has rate limits.
+
+## Skill Issue Department
+
+The separate parent bot accepts explicit @mentions in the management channel `1571760182248218634` and its threads. Mention it with a Together AI change request. It creates a discussion thread and maintains a public status card with Edit request, approval and cancellation buttons. Thread follow-ups also require an @mention. Only the requester can approve or edit their proposal.
+
+The parent runs the installed protecting-your-energy `UserPromptSubmit` hook before each model planning call, reads the current child implementation, asks necessary clarifying questions, and attaches a proposed diff. Confirmation queues the exact reviewed change. Source changes since review require a fresh proposal and approval. Requests are planned and deployed sequentially. Waiting for one person's clarification does not block other ready requests.
+
+The parent can edit Together AI's Python modules, persona and model/participation settings. Its own runtime, credentials, dependencies, service configuration and conversation database are outside the generated patch interface. Deployment restarts Together AI and checks its Discord-ready log. Failure restores the previous files and settings. Interrupted deployments are recovered on parent startup. Request revisions and before-change snapshots persist in a separate private SQLite database.
+
+Use Edit request on a completed card or @mention the parent in its thread to refine an implemented change. Each revision needs fresh approval. Changes are recorded locally by the parent in its audit database. Source publication remains an operator action.
+
+The parent runs through `skill-issue-department.service` with `PARENT_CONFIG` pointing at its private configuration. Together AI ignores the management channel and its threads so the parent owns that conversation. Both services run on this host.

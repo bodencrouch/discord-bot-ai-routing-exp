@@ -1,0 +1,17 @@
+[Unit]
+Description=Skill Issue Department Discord parent bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/run/media/brunner56/MyBook/Documents/Codex/2026-11-15/crea/outputs/together-ai
+Environment=PARENT_CONFIG=/run/media/brunner56/MyBook/Documents/Codex/2026-11-15/crea/work/private/parent-config.json
+ExecStart=/run/media/brunner56/MyBook/Documents/Codex/2026-11-15/crea/outputs/together-ai/.venv/bin/python -m parent_ai
+Restart=always
+RestartSec=5
+UMask=0077
+NoNewPrivileges=true
+
+[Install]
+WantedBy=default.target
