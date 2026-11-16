@@ -4,10 +4,15 @@ import difflib
 import hashlib
 import json
 import os
+import random
+import time
+from email.utils import parsedate_to_datetime
 import sys
 from pathlib import Path
 
 import httpx
+
+CONTEXT_HASH_VERSION = 2
 
 PRIVATE_FIELDS = {"discord_token_file", "api_key_file", "database"}
 CONFIG_FIELDS = {
@@ -145,6 +150,107 @@ class Changes:
         return context
 
     @staticmethod
+    def context_digest(context):
+        """Hash substantive evidence while excluding display names and retrieval diagnostics."""
+
+        def image_state(value):
+            outer = value if isinstance(value, dict) else {}
+            image = outer.get("image_url", value)
+            image = {"url": image} if isinstance(image, str) else image
+            if not isinstance(image, dict):
+                return None
+            payload = image.get("url", image.get("data", ""))
+            mime = image.get("mime_type", image.get("mimeType", "image/png"))
+            if (
+                isinstance(payload, str)
+                and payload.startswith("data:")
+                and "," in payload
+            ):
+                header, encoded = payload.split(",", 1)
+                mime = header[5:].split(";", 1)[0]
+                try:
+                    payload = (
+                        base64.b64decode(encoded, validate=True)
+                        if ";base64" in header
+                        else encoded.encode()
+                    )
+                except (ValueError, TypeError):
+                    payload = encoded.encode()
+            identity = {"mime": mime, "detail": image.get("detail", "auto")}
+            if isinstance(payload, bytes):
+                identity["bytes_sha256"] = hashlib.sha256(payload).hexdigest()
+            else:
+                identity["url"] = str(payload)
+            for key in (
+                "attachment_id",
+                "filename",
+                "label",
+                "description",
+                "caption",
+                "alt",
+                "title",
+            ):
+                if image.get(key, outer.get(key)) is not None:
+                    identity[key] = image.get(key, outer.get(key))
+            source_id = (
+                image.get("message_id")
+                or image.get("source_id")
+                or outer.get("message_id")
+                or outer.get("source_id")
+            )
+            if source_id is not None:
+                identity["source_id"] = str(source_id)
+            return identity
+
+        if isinstance(context, str):
+            data = {"text": context}
+        elif isinstance(context, list):
+            data = {"messages": context}
+        else:
+            data = context if isinstance(context, dict) else {}
+        canonical = {"text": data.get("text", ""), "messages": [], "images": []}
+        for value in data.get("images", []):
+            image = image_state(value)
+            if image is not None:
+                canonical["images"].append(image)
+        for message in data.get("messages", []):
+            if not isinstance(message, dict):
+                continue
+            if message.get("type") == "image_url":
+                canonical["images"].append(image_state(message))
+                continue
+            content = message.get("content", "")
+            if isinstance(content, list):
+                parts = []
+                for part in content:
+                    if isinstance(part, dict) and part.get("type") == "image_url":
+                        parts.append({"image": image_state(part)})
+                    elif isinstance(part, dict) and part.get("type") == "text":
+                        parts.append({"text": part.get("text", "")})
+                content = parts
+            author = message.get("author")
+            canonical["messages"].append(
+                {
+                    "source_id": str(
+                        message.get("message_id") or message.get("source_id") or ""
+                    ),
+                    "author_id": author.get("id")
+                    if isinstance(author, dict)
+                    else message.get("author_id"),
+                    "role": message.get("role"),
+                    "content": content,
+                    "images": [
+                        image_state(value) for value in message.get("images", [])
+                    ],
+                }
+            )
+        return hashlib.sha256(
+            json.dumps(
+                canonical, sort_keys=True, default=str, separators=(",", ":")
+            ).encode()
+        ).hexdigest()
+
+    @staticmethod
     def planning_content(request, base, context):
         images, history = [], []
 
@@ -210,7 +316,8 @@ class Changes:
                         "author": message.get("author"),
                         "role": message.get("role"),
                         "content": str(content)[:6000],
-                        "message_id": message.get("message_id"),
+                        "message_id": message.get("message_id")
+                        or message.get("source_id"),
                     }
                 )
                 for image in message.get("images", []):
@@ -430,6 +537,7 @@ Use the most recent follow-up as the user's current intent. Be concise and light
         }
         turn = 0
         request_hash = hashlib.sha256(str(request).encode()).hexdigest()
+        context_hash = self.context_digest(context)
         base_digest = self.digest(base)
         if resume:
             try:
@@ -438,6 +546,39 @@ Use the most recent follow-up as the user's current intent. Be concise and light
                     or resume.get("request_hash") != request_hash
                 ):
                     raise ValueError("source or request changed")
+                if "context_hash" in resume:
+                    if resume.get("context_hash_version") == CONTEXT_HASH_VERSION:
+                        context_matches = resume["context_hash"] == context_hash
+                    elif resume.get("context_hash_version") is None:
+                        legacy_hash = hashlib.sha256(
+                            json.dumps(
+                                context,
+                                sort_keys=True,
+                                default=str,
+                                separators=(",", ":"),
+                            ).encode()
+                        ).hexdigest()
+                        context_matches = resume["context_hash"] == legacy_hash
+                    else:
+                        context_matches = False
+                    if not context_matches:
+                        raise ValueError(
+                            "supplied context, image data, or checkpoint hash format changed"
+                        )
+                else:
+                    legacy_images = any(
+                        isinstance(message, dict)
+                        and isinstance(message.get("content"), list)
+                        and any(
+                            isinstance(part, dict) and part.get("type") == "image_url"
+                            for part in message["content"]
+                        )
+                        for message in resume.get("messages", [])
+                    )
+                    if context is not None or legacy_images:
+                        raise ValueError(
+                            "legacy checkpoint cannot validate supplied context or images"
+                        )
                 if resume.get("route") not in {
                     self.config.get("model", "auto/best-free"),
                     fallback,
@@ -483,7 +624,7 @@ Use the most recent follow-up as the user's current intent. Be concise and light
                 )
             except (ValueError, TypeError, KeyError, SyntaxError):
                 await emit(
-                    "The prior checkpoint does not match the current source or request. Starting a fresh plan from the current snapshot."
+                    "The prior checkpoint does not match the current source, request, or supplied context/images. Starting a fresh plan from the current snapshot."
                 )
 
         async def save_checkpoint():
@@ -511,6 +652,8 @@ Use the most recent follow-up as the user's current intent. Be concise and light
                 {
                     "base_digest": base_digest,
                     "request_hash": request_hash,
+                    "context_hash": context_hash,
+                    "context_hash_version": CONTEXT_HASH_VERSION,
                     "messages": saved,
                     "staged": dict(staged),
                     "seen_calls": dict(seen_calls),
@@ -522,6 +665,52 @@ Use the most recent follow-up as the user's current intent. Be concise and light
                     "route_trace": list(route_trace),
                 }
             )
+
+        async def request_with_retries(body):
+            for attempt in range(3):
+                response = None
+                try:
+                    response = await self.http.post(
+                        c["base_url"].rstrip("/") + "/chat/completions",
+                        headers=headers,
+                        json=body,
+                    )
+                except httpx.TransportError as error:
+                    if attempt == 2:
+                        raise
+                    failure = type(error).__name__
+                else:
+                    if (
+                        response.status_code not in {408, 429}
+                        and not 500 <= response.status_code <= 599
+                    ):
+                        return response
+                    if attempt == 2:
+                        return response
+                    failure = f"HTTP {response.status_code}"
+                delay = float(attempt + 1)
+                retry_after = (
+                    response.headers.get("Retry-After")
+                    if response is not None
+                    else None
+                )
+                if retry_after:
+                    try:
+                        delay = max(delay, float(retry_after))
+                    except ValueError:
+                        try:
+                            delay = max(
+                                delay,
+                                parsedate_to_datetime(retry_after).timestamp()
+                                - time.time(),
+                            )
+                        except (ValueError, TypeError, OverflowError):
+                            pass
+                delay = min(10.0, max(0.0, delay) + random.uniform(0, 0.25))
+                await emit(
+                    f"Transient planning failure on {route} ({failure}, attempt {attempt + 1}/3). Retrying the same request in {delay:.1f}s; the planning checkpoint is preserved."
+                )
+                await asyncio.sleep(delay)
 
         attempt_turns = 0
         while attempt_turns < max_turns:
@@ -535,12 +724,28 @@ Use the most recent follow-up as the user's current intent. Be concise and light
             else:
                 body.update(tools=tools, tool_choice="none" if force_final else "auto")
             await save_checkpoint()
-            response = await self.http.post(
-                c["base_url"].rstrip("/") + "/chat/completions",
-                headers=headers,
-                json=body,
-            )
+            try:
+                response = await request_with_retries(body)
+            except httpx.TransportError as error:
+                if await use_fallback(
+                    "transport failures persisted after three same-route attempts"
+                ):
+                    continue
+                raise RuntimeError(
+                    f"Planning route {route} failed after three transport attempts. Retry can resume the preserved planning checkpoint."
+                ) from error
             if not response.is_success:
+                if (
+                    response.status_code in {408, 429}
+                    or 500 <= response.status_code <= 599
+                ):
+                    if await use_fallback(
+                        f"HTTP {response.status_code} persisted after three same-route attempts"
+                    ):
+                        continue
+                    raise RuntimeError(
+                        f"Planning route {route} returned HTTP {response.status_code} after three attempts. Retry can resume the preserved planning checkpoint."
+                    )
                 provider_error = response.text.lower()
                 if response.status_code in {400, 422}:
                     if (

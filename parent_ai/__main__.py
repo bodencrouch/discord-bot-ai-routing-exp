@@ -15,6 +15,39 @@ from .changes import Changes, StaleProposal
 from .recovery import SessionStore, rewind_activity
 
 
+def progress_icon(message):
+    """Choose a compact activity indicator without changing the underlying message."""
+    text = message.lower()
+    categories = (
+        ("🛠️", ("tool call",)),
+        ("📥", ("tool result",)),
+        ("❌", ("request failed", "error", "timed out", "could not", "unavailable")),
+        ("🔄", ("retry", "retrying", "resuming", "checkpoint")),
+        (
+            "🚀",
+            (
+                "deployment",
+                "deploying",
+                "applying",
+                "files applied",
+                "restarting",
+                "reconnected",
+                "source matches",
+                "change is complete",
+            ),
+        ),
+        ("📋", ("proposal", "preview", "approval", "approved", "diff")),
+        ("🧭", ("hook", "protecting-your-energy")),
+        ("📚", ("retrieved", "context", "reading", "read ")),
+        ("🧠", ("model turn", "thinking", "planning", "route", "protocol")),
+        ("🛑", ("cancelled",)),
+    )
+    for icon, terms in categories:
+        if any(term in text for term in terms):
+            return icon
+    return "💬"
+
+
 class EditRequest(discord.ui.Modal, title="Refine the skill issue"):
     request = discord.ui.TextInput(
         label="What should change?", style=discord.TextStyle.paragraph, max_length=4000
@@ -70,6 +103,12 @@ class RequestButton(
                 "The requester or a server administrator can manage this change."
             )
             return
+        busy = getattr(bot, "cleanup_running", None)
+        if busy and busy():
+            await interaction.response.send_message(
+                "Server cleanup is in progress. Retry when it finishes.", ephemeral=True
+            )
+            return
         if job["version"] != self.version or job["state"] == "applying":
             await interaction.response.send_message(
                 f"This is an older revision or deployment is in progress. Current status: **{job['state']}**, revision {job['version']}. Open <#{job['thread']}> for the live controls and activity."
@@ -80,11 +119,17 @@ class RequestButton(
             return
         await interaction.response.defer()
         job = bot.get(self.job)
-        if not job or job["version"] != self.version or job["state"] == "applying":
+        if (
+            not job
+            or job["version"] != self.version
+            or job["state"] == "applying"
+            or (busy and busy())
+        ):
             await interaction.followup.send(
                 "This preview changed. Use the latest card."
             )
             return
+        expected_version = self.version
         if self.action == "approve":
             if job["state"] != "awaiting":
                 await interaction.followup.send(
@@ -95,10 +140,11 @@ class RequestButton(
             if bot.changes.digest(bot.changes.snapshot()) != bot.changes.digest(
                 proposal["base"]
             ):
+                expected_version = self.version + 1
                 bot.update(
                     self.job,
                     state="queued",
-                    version=self.version + 1,
+                    version=expected_version,
                     note="The child changed. Preparing a fresh preview for approval.",
                 )
             else:
@@ -108,45 +154,68 @@ class RequestButton(
                     note="Confirmed. Waiting for the deployment queue.",
                 )
         elif self.action == "cancel":
+            expected_version = self.version + 1
             bot.update(
                 self.job,
                 state="cancelled",
                 version=self.version + 1,
                 note="Cancelled. No further changes will be applied.",
             )
-        elif self.action == "retry" and job["state"] == "failed":
+        elif self.action == "retry":
+            if job["state"] != "failed":
+                await interaction.followup.send(
+                    "Planning retry is available after a failed attempt. Use the latest controls."
+                )
+                return
+            retry_version = self.version + 1
+            expected_version = retry_version
             bot.update(
                 self.job,
                 state="rewinding",
-                version=self.version + 1,
+                version=retry_version,
                 note="Queued for another planning attempt.",
             )
-            if interaction.message:
-                try:
-                    await interaction.message.edit(view=None)
-                except discord.NotFound:
-                    pass
-            checkpoint = bot.sessions.load(self.job)
-            marker = (
-                checkpoint.get("activity_message_id")
-                if checkpoint
-                else str(job["source"])
-            )
             try:
+                if interaction.message:
+                    try:
+                        await interaction.message.edit(view=None)
+                    except discord.NotFound:
+                        pass
+                    if not bot.retry_is_current(self.job, retry_version):
+                        return
+                checkpoint = bot.sessions.load(self.job)
+                marker = (checkpoint or {}).get("activity_message_id") or str(
+                    job["source"]
+                )
                 await rewind_activity(bot, self.job, marker)
             except discord.HTTPException as error:
+                if not bot.retry_is_current(self.job, retry_version):
+                    return
                 bot.update(
                     self.job,
                     state="failed",
                     note=f"Retry could not rewind the later bot output (Discord HTTP {error.status}).",
                 )
                 await bot.card(self.job)
-                await bot.progress(
-                    self.job, "Request failed: " + bot.get(self.job)["note"]
-                )
+                current = bot.get(self.job)
+                if (
+                    current
+                    and current["version"] == retry_version
+                    and current["state"] == "failed"
+                    and not (busy and busy())
+                ):
+                    await bot.progress(self.job, "Request failed: " + current["note"])
+                return
+            if not bot.retry_is_current(self.job, retry_version):
                 return
             bot.update(self.job, state="queued")
+        current = bot.get(self.job)
+        if not current or current["version"] != expected_version or (busy and busy()):
+            return
         await bot.card(self.job)
+        current = bot.get(self.job)
+        if not current or current["version"] != expected_version or (busy and busy()):
+            return
         await bot.progress(
             self.job,
             {
@@ -201,6 +270,16 @@ class Parent(discord.Client):
             getattr(getattr(user, "guild_permissions", None), "administrator", False)
         )
 
+    def retry_is_current(self, job_id, version):
+        job = self.get(job_id)
+        busy = getattr(self, "cleanup_running", None)
+        return bool(
+            job
+            and job["version"] == version
+            and job["state"] == "rewinding"
+            and not (busy and busy())
+        )
+
     def get(self, job_id):
         return self.db.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
 
@@ -252,11 +331,15 @@ class Parent(discord.Client):
             "SELECT * FROM jobs WHERE state='rewinding'"
         ).fetchall():
             saved = self.sessions.load(job["id"])
-            marker = saved.get("activity_message_id") if saved else str(job["source"])
+            marker = (saved or {}).get("activity_message_id") or str(job["source"])
             try:
                 await rewind_activity(self, job["id"], marker)
+                if not self.retry_is_current(job["id"], job["version"]):
+                    continue
                 self.update(job["id"], state="queued")
             except discord.HTTPException:
+                if not self.retry_is_current(job["id"], job["version"]):
+                    continue
                 self.update(
                     job["id"],
                     state="failed",
@@ -267,8 +350,14 @@ class Parent(discord.Client):
         for job in self.db.execute(
             "SELECT * FROM jobs WHERE state='failed' AND thread IS NOT NULL"
         ).fetchall():
-            thread = self.get_channel(job["thread"])
-            if thread is None:
+            try:
+                thread = self.get_channel(job["thread"]) or await self.fetch_channel(
+                    job["thread"]
+                )
+                if thread.archived:
+                    await thread.edit(archived=False)
+            except discord.HTTPException:
+                logging.exception("Could not retrieve failed request thread")
                 continue
             view = discord.ui.View(timeout=None)
             view.add_item(RequestButton(job["id"], job["version"], "retry"))
@@ -306,7 +395,8 @@ class Parent(discord.Client):
             )
             if thread.archived:
                 await thread.edit(archived=False)
-            content = f"**Activity · #{job_id}** {message}"
+            icon = progress_icon(message)
+            content = f"{icon} {message}"
             view = None
             if job["state"] == "failed" and message.startswith("Request failed:"):
                 view = discord.ui.View(timeout=None)
@@ -315,12 +405,13 @@ class Parent(discord.Client):
                 sent = await thread.send(content, view=view)
             else:
                 sent = await thread.send(
-                    f"**Activity · #{job_id}** Full model or tool output attached.",
+                    f"{icon} Full model or tool output attached.",
                     file=discord.File(
                         io.BytesIO(message.encode()), filename="activity.txt"
                     ),
                     view=view,
                 )
+            self.sessions.record_output(job_id, sent.id, thread.id, "progress")
             self.activity_messages[job_id] = str(sent.id)
             if view is not None:
                 self.update(job_id, failure_message=str(sent.id))
@@ -411,11 +502,13 @@ class Parent(discord.Client):
                 try:
                     msg = await destination.fetch_message(job[field])
                     await msg.edit(**params)
+                    self.sessions.record_output(job_id, msg.id, destination.id, field)
                     continue
                 except discord.NotFound:
                     pass
             params.pop("attachments", None)
             msg = await destination.send(**params, files=files)
+            self.sessions.record_output(job_id, msg.id, destination.id, field)
             self.update(job_id, **{field: msg.id})
 
     async def revise(self, interaction, job_id, version, text):
@@ -599,9 +692,22 @@ class Parent(discord.Client):
                     messages[message.id] = message
         except discord.HTTPException as error:
             errors.append({"source_id": str(job["source"]), "status": error.status})
-        async for message in thread.history(limit=40):
+        scanned = 0
+        retained = 0
+        async for message in thread.history(limit=500):
+            scanned += 1
             if not message.author.bot:
                 messages[message.id] = message
+                retained += 1
+                if retained >= 40:
+                    break
+        if scanned == 500 and retained < 40:
+            errors.append(
+                {
+                    "scope": "thread_history",
+                    "reason": "Scanned 500 recent posts before reaching 40 human messages",
+                }
+            )
         links = re.findall(
             r"https?://(?:www\.)?discord\.com/channels/(\d+)/(\d+)/(\d+)",
             job["request"],
@@ -652,6 +758,23 @@ class Parent(discord.Client):
                     continue
                 try:
                     raw = await attachment.read()
+                    if raw.startswith(b"\x89PNG\r\n\x1a\n"):
+                        mime = "image/png"
+                    elif raw.startswith(b"\xff\xd8\xff"):
+                        mime = "image/jpeg"
+                    elif raw.startswith((b"GIF87a", b"GIF89a")):
+                        mime = "image/gif"
+                    elif raw.startswith(b"RIFF") and raw[8:12] == b"WEBP":
+                        mime = "image/webp"
+                    else:
+                        errors.append(
+                            {
+                                "source_id": str(message.id),
+                                "file": attachment.filename,
+                                "reason": "Unsupported image bytes",
+                            }
+                        )
+                        continue
                     context["images"].append(
                         {
                             "url": "data:"

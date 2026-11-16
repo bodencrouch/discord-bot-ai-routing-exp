@@ -23,7 +23,38 @@ class SessionStore:
                 updatedat TEXT NOT NULL
             )"""
         )
+        self.db.execute(
+            """CREATE TABLE IF NOT EXISTS planning_job_outputs (
+                message_id TEXT PRIMARY KEY, job_id TEXT NOT NULL,
+                thread_id TEXT, kind TEXT NOT NULL
+            )"""
+        )
         self.db.commit()
+
+    def record_output(self, job_id, message_id, thread_id=None, kind="progress"):
+        """Persist which job owns an outgoing Discord message."""
+        with self.lock, self.db:
+            self.db.execute(
+                """INSERT INTO planning_job_outputs VALUES (?,?,?,?)
+                   ON CONFLICT(message_id) DO UPDATE SET job_id=excluded.job_id,
+                       thread_id=excluded.thread_id,kind=excluded.kind""",
+                (
+                    str(message_id),
+                    str(job_id),
+                    str(thread_id) if thread_id is not None else None,
+                    str(kind),
+                ),
+            )
+
+    def output_ids(self, job_id, thread_id):
+        with self.lock:
+            return {
+                row[0]
+                for row in self.db.execute(
+                    "SELECT message_id FROM planning_job_outputs WHERE job_id=? AND thread_id=?",
+                    (str(job_id), str(thread_id)),
+                )
+            }
 
     def save(self, job_id, state, activity_message_id=None):
         """Atomically replace a checkpoint, retaining an omitted activity marker."""
@@ -68,7 +99,7 @@ class SessionStore:
 
 
 async def rewind_activity(bot, job_id, activity_message_id):
-    """Delete this bot's later activity while retaining humans and the checkpoint.
+    """Delete this job's later bot output while retaining humans and the checkpoint.
 
     Resolve the job's actual thread and use the numeric checkpoint as a stable
     chronological boundary, even if its message was deleted. Discord's history
@@ -92,11 +123,24 @@ async def rewind_activity(bot, job_id, activity_message_id):
         thread = bot.get_channel(thread_id) or await bot.fetch_channel(thread_id)
     except discord.NotFound:
         return 0
+    owned = bot.sessions.output_ids(job_id, thread_id)
+    for field in ("thread_card", "failure_message"):
+        if field in job.keys() and job[field]:
+            owned.add(str(job[field]))
     deleted = 0
     async for message in thread.history(
         limit=None, after=discord.Object(id=checkpoint_id), oldest_first=True
     ):
         if message.id <= checkpoint_id or message.author.id != bot.user.id:
+            continue
+        legacy_activity = (getattr(message, "content", "") or "").startswith(
+            f"**Activity · #{job_id}**"
+        )
+        legacy_card = any(
+            f"Skill Issue #{job_id} ·" in (getattr(embed, "title", "") or "")
+            for embed in getattr(message, "embeds", [])
+        )
+        if str(message.id) not in owned and not legacy_activity and not legacy_card:
             continue
         is_system = getattr(message, "is_system", None)
         message_type = getattr(message, "type", None)
