@@ -77,8 +77,14 @@ class RequestButton(
             return
         await interaction.response.defer()
         job = bot.get(self.job)
-        if not job or job["version"] != self.version or job["state"] in {"applying", "planning"}:
-            await interaction.followup.send("This preview changed. Use the latest card.")
+        if (
+            not job
+            or job["version"] != self.version
+            or job["state"] in {"applying", "planning"}
+        ):
+            await interaction.followup.send(
+                "This preview changed. Use the latest card."
+            )
             return
         if self.action == "approve":
             if job["state"] != "awaiting":
@@ -114,6 +120,14 @@ class RequestButton(
                 note="Queued for another planning attempt.",
             )
         await bot.card(self.job)
+        await bot.progress(
+            self.job,
+            {
+                "approve": "Approval received. Checking the reviewed source before deployment.",
+                "cancel": "Request cancelled.",
+                "retry": "Retrying planning.",
+            }.get(self.action, "Request updated."),
+        )
         bot.wake.set()
 
 
@@ -133,6 +147,10 @@ class Parent(discord.Client):
             id INTEGER PRIMARY KEY AUTOINCREMENT, source TEXT UNIQUE, author INTEGER,
             request TEXT, state TEXT, version INTEGER DEFAULT 1, thread INTEGER,
             card INTEGER, proposal TEXT, note TEXT DEFAULT '')""")
+        if "thread_card" not in {
+            row[1] for row in self.db.execute("PRAGMA table_info(jobs)")
+        }:
+            self.db.execute("ALTER TABLE jobs ADD COLUMN thread_card INTEGER")
         self.db.execute(
             "CREATE TABLE IF NOT EXISTS audit (id INTEGER PRIMARY KEY AUTOINCREMENT, job INTEGER, snapshot TEXT, recorded_at TEXT DEFAULT CURRENT_TIMESTAMP)"
         )
@@ -190,6 +208,13 @@ class Parent(discord.Client):
         await self.change_presence(
             activity=discord.Game(name="parental controls · @mention me")
         )
+        for job in self.db.execute(
+            "SELECT id FROM jobs WHERE thread IS NOT NULL AND thread_card IS NULL AND state IN ('awaiting','clarify','approved','failed','done')"
+        ).fetchall():
+            try:
+                await self.card(job["id"], attach=True)
+            except discord.HTTPException:
+                logging.exception("Could not restore thread review card")
         self.wake.set()
 
     async def close(self):
@@ -205,6 +230,20 @@ class Parent(discord.Client):
         await self.changes.http.aclose()
         self.db.close()
         await super().close()
+
+    async def progress(self, job_id, message):
+        job = self.get(job_id)
+        if not job or not job["thread"]:
+            return
+        try:
+            thread = self.get_channel(job["thread"]) or await self.fetch_channel(
+                job["thread"]
+            )
+            if thread.archived:
+                await thread.edit(archived=False)
+            await thread.send(f"**Activity · #{job_id}** {message}")
+        except discord.HTTPException:
+            logging.exception("Could not post request activity")
 
     async def card(self, job_id, attach=False):
         job = self.get(job_id)
@@ -252,16 +291,43 @@ class Parent(discord.Client):
                     filename=f"proposal-{job_id}-v{job['version']}.md",
                 ),
             ]
-        if job["card"]:
-            try:
-                msg = await channel.fetch_message(job["card"])
-                await msg.edit(**kwargs)
-                return
-            except discord.NotFound:
-                pass
-        files = kwargs.pop("attachments", [])
-        message = await channel.send(**kwargs, files=files)
-        self.update(job_id, card=message.id)
+        for field, destination in (
+            ("card", channel),
+            ("thread_card", self.get_channel(job["thread"]) if job["thread"] else None),
+        ):
+            if field == "thread_card" and destination is None and job["thread"]:
+                destination = await self.fetch_channel(job["thread"])
+            if not destination:
+                continue
+            if getattr(destination, "archived", False):
+                await destination.edit(archived=False)
+            # Each Discord send needs fresh file objects.
+            files = []
+            if attach and job["proposal"]:
+                proposal = json.loads(job["proposal"])
+                files = [
+                    discord.File(
+                        io.BytesIO(self.changes.diff(proposal).encode()),
+                        filename=f"change-{job_id}-v{job['version']}.diff",
+                    ),
+                    discord.File(
+                        io.BytesIO(proposal["plan"]["summary"].encode()),
+                        filename=f"proposal-{job_id}-v{job['version']}.md",
+                    ),
+                ]
+            params = {"embed": embed, "view": view}
+            if attach:
+                params["attachments"] = files
+            if job[field]:
+                try:
+                    msg = await destination.fetch_message(job[field])
+                    await msg.edit(**params)
+                    continue
+                except discord.NotFound:
+                    pass
+            params.pop("attachments", None)
+            msg = await destination.send(**params, files=files)
+            self.update(job_id, **{field: msg.id})
 
     async def revise(self, interaction, job_id, version, text):
         job = self.get(job_id)
@@ -451,7 +517,9 @@ class Parent(discord.Client):
                 note="Reading the current implementation and running protecting-your-energy.",
             )
             await self.card(job_id)
-            proposal = await self.changes.propose(job["request"], job_id)
+            proposal = await self.changes.propose(
+                job["request"], job_id, lambda message: self.progress(job_id, message)
+            )
             if (
                 self.get(job_id)["version"] != version
                 or self.get(job_id)["state"] != "planning"
@@ -478,7 +546,10 @@ class Parent(discord.Client):
             )
             if thread.archived:
                 await thread.edit(archived=False)
-            await thread.send(note[:1900])
+            await self.progress(
+                job_id,
+                "Proposal ready for review." if state == "awaiting" else note[:1600],
+            )
             await self.card(job_id, attach=True)
         except Exception as exc:
             logging.exception("Request failed")
@@ -491,6 +562,9 @@ class Parent(discord.Client):
                     else "The department hit an error. Retry planning or refine the request.",
                 )
                 await self.card(job_id)
+                await self.progress(
+                    job_id, f"Request failed: {self.get(job_id)['note']}"
+                )
 
     async def deploy(self, job_id, version, job):
         proposal = json.loads(job["proposal"])
@@ -511,8 +585,16 @@ class Parent(discord.Client):
             note="Approved change is being applied. Checking restart health.",
         )
         await self.card(job_id)
+        await self.progress(
+            job_id,
+            "Source matches the approved preview. Applying the reviewed files and settings.",
+        )
         try:
             self.changes.install(proposal)
+            await self.progress(
+                job_id,
+                "Files applied. Restarting Together AI and waiting for its Discord connection.",
+            )
             await self.changes.restart()
         except StaleProposal:
             self.update(
@@ -545,6 +627,9 @@ class Parent(discord.Client):
             note="Applied. Together AI reconnected successfully. Use Edit request or @mention me in the thread to refine it.",
         )
         await self.card(job_id, attach=True)
+        await self.progress(
+            job_id, "Together AI reconnected. The approved change is complete."
+        )
 
 
 def main():

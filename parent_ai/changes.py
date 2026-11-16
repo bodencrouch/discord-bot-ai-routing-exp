@@ -71,9 +71,20 @@ class Changes:
             )
         return context
 
-    async def propose(self, request, job_id):
+    async def propose(self, request, job_id, progress=None):
+        async def emit(message):
+            if progress:
+                await progress(message)
+
+        await emit("Reading Together AI source and current allowed settings.")
         base = self.snapshot()
+        await emit(
+            f"Read {len(base['files'])} source files. Running the protecting-your-energy prompt hook."
+        )
         guidance = await self.hook(request, f"skill-issue-{job_id}")
+        await emit(
+            "Hook completed. Sending the request and source to the planning model; this planner uses one model call and has no tool calls."
+        )
         system = """You are Skill Issue Department, the parent maintenance bot for Together AI.
 Use a lightly memeish, friendly voice: competent caretaker with occasional "skill issue" humor.
 Keep summary to two to four plain sentences describing the change and any material tradeoff.
@@ -124,11 +135,18 @@ Preserve the child's READY logging so deployment health can be verified.
             raise RuntimeError(
                 f"Planning route returned HTTP {response.status_code}. Please retry."
             )
-        content = response.json()["choices"][0]["message"]["content"].strip()
+        result = response.json()
+        await emit(
+            f"Planning model returned HTTP {response.status_code}. Validating its proposed files, settings and Python syntax."
+        )
+        content = result["choices"][0]["message"]["content"].strip()
         if content.startswith("```"):
             content = content.split("\n", 1)[1].rsplit("```", 1)[0]
         plan = json.loads(content)
         self.validate(plan)
+        await emit(
+            f"Validation complete. Proposed {len(plan['files'])} source file(s), {len(plan['config'])} setting(s), and {len(plan['questions'])} clarification question(s)."
+        )
         return {"base": base, "plan": plan, "hook_applied": True}
 
     def validate(self, plan):
