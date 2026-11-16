@@ -244,6 +244,7 @@ Use the most recent follow-up as the user's current intent. Be concise and light
         staged = {}
         seen_calls = {}
         force_final = False
+        invalid_proposals = 0
         messages = [
             {
                 "role": "system",
@@ -288,6 +289,11 @@ Use the most recent follow-up as the user's current intent. Be concise and light
                     plan["files"] = staged | plan.get("files", {})
                     self.validate(plan)
                 except (ValueError, TypeError, KeyError, SyntaxError) as exc:
+                    invalid_proposals += 1
+                    if invalid_proposals >= 3:
+                        raise RuntimeError(
+                            "The configured planning route returned three invalid proposals. Its responses are visible above. Retry planning or choose another parent route."
+                        ) from exc
                     messages.append({"role": "assistant", "content": content})
                     messages.append(
                         {
