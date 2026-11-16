@@ -7,5 +7,5 @@
     "energy_hook": "/absolute/path/to/protecting-your-energy/hooks/energy.py",
     "model": "auto/best-free",
     "planning_fallback_model": "auto/fast",
-    "planning_reasoning_effort": "low",
+    "planning_reasoning_effort": "low"
 }

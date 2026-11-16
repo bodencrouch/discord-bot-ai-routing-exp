@@ -2,6 +2,7 @@
 
 import asyncio
 import hmac
+import inspect
 import json
 import mimetypes
 import secrets
@@ -45,10 +46,17 @@ class Dashboard:
     def jobs(self):
         jobs = []
         for instance in self.state.instances():
-            if instance.get("preset") != "maintenance":
+            controller = getattr(
+                self.hub.clients.get(instance["id"]), "maintenance_controller", None
+            )
+            if instance.get("preset") != "maintenance" and controller is None:
                 continue
             try:
-                config = json.loads(Path(instance["config_file"]).read_text())
+                config = (
+                    controller.config
+                    if controller
+                    else json.loads(Path(instance["config_file"]).read_text())
+                )
                 connection = sqlite3.connect(
                     "file:" + config["database"] + "?mode=ro", uri=True
                 )
@@ -248,6 +256,7 @@ class Dashboard:
             snapshot_id = data.get("snapshot_id")
             if not isinstance(snapshot_id, str):
                 raise ValueError("Review a cleanup snapshot first.")
+            snapshot = self.cleanup_snapshot(guild_id, snapshot_id)
             if instance.get("dry_run"):
                 return {
                     "ok": True,
@@ -257,12 +266,22 @@ class Dashboard:
                         "message": "Dry-run cleanup preview recorded.",
                     },
                 }
-            self.hub.cleanup.start(guild_id, "dashboard-owner", snapshot_id)
+            kwargs = {}
+            if hasattr(self.hub.cleanup, "claim"):
+                kwargs["resume"] = data.get("resume") is True and snapshot.get(
+                    "status"
+                ) in {"partial", "failed", "interrupted"}
+            operation = self.hub.cleanup.start(
+                guild_id, "dashboard-owner", snapshot_id, **kwargs
+            )
+            if inspect.iscoroutine(operation):
+                await operation
             return {
                 "ok": True,
                 "running": True,
                 "status": "running",
                 "job_id": snapshot_id,
+                "snapshot_id": snapshot_id,
             }
         if (
             len(parts) == 4
@@ -587,11 +606,15 @@ class Dashboard:
                         instance_id = unquote(
                             request.path.removeprefix("/api/cleanup/")
                         )
-                        refresh = parse_qs(request.query).get("refresh") == ["1"]
+                        query = parse_qs(request.query, keep_blank_values=True)
+                        refresh = query.get("refresh") == ["1"]
+                        snapshot_id = query.get("snapshot_id", [None])[0]
                         self.reply(
                             200,
                             asyncio.run_coroutine_threadsafe(
-                                dashboard.get_cleanup(instance_id, refresh),
+                                dashboard.get_cleanup(
+                                    instance_id, refresh, snapshot_id=snapshot_id
+                                ),
                                 dashboard.loop,
                             ).result(90),
                         )
@@ -704,12 +727,45 @@ class Dashboard:
         settings = json.loads(Path(instance["config_file"]).read_text())
         return instance, str(settings["guild_id"])
 
-    async def get_cleanup(self, instance_id, refresh=False):
+    def cleanup_channel(self, guild_id):
+        for client in self.hub.clients.values():
+            config = getattr(client, "config", {})
+            if (
+                getattr(client, "instance", {}).get("preset") == "maintenance"
+                and str(config.get("guild_id")) == str(guild_id)
+                and config.get("channel_id")
+            ):
+                return str(config["channel_id"])
+        for client in self.hub.clients.values():
+            guild = client.get_guild(int(guild_id))
+            channel = getattr(guild, "system_channel", None)
+            if channel is not None:
+                return str(channel.id)
+        return None
+
+    def cleanup_snapshot(self, guild_id, snapshot_id):
+        if not isinstance(snapshot_id, str) or not snapshot_id.strip():
+            raise ValueError("Review a cleanup snapshot first.")
+        hint = self.cleanup_channel(guild_id)
+        # Re-read and persist only recovery metadata under the store lock.
+        with self.state.lock:
+            snapshot = self.hub.cleanup._get(snapshot_id)
+            if not snapshot or str(snapshot.get("guild_id")) != str(guild_id):
+                raise ValueError("Cleanup snapshot does not belong to this server.")
+            if hint and not snapshot.get("channel_id"):
+                snapshot["channel_id"] = hint
+                self.hub.cleanup._save(snapshot)
+            return self.hub.cleanup.public(snapshot)
+
+    async def get_cleanup(self, instance_id, refresh=False, snapshot_id=None):
         _, guild_id = self.cleanup_instance(instance_id)
+        if snapshot_id is not None:
+            return self.cleanup_snapshot(guild_id, snapshot_id)
         current = self.hub.cleanup.latest(guild_id)
         if current and (not refresh or self.hub.cleanup.is_running(guild_id)):
-            return current
-        return await self.hub.cleanup.preview(guild_id)
+            return self.cleanup_snapshot(guild_id, current["snapshot_id"])
+        current = await self.hub.cleanup.preview(guild_id)
+        return self.cleanup_snapshot(guild_id, current["snapshot_id"])
 
     async def get_turn(self, instance_id, key):
         return await asyncio.to_thread(self.turn, instance_id, key)

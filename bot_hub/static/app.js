@@ -657,7 +657,7 @@ function renderCleanup() {
   }
   const preview = local.preview || {};
   const permissions = rows(preview.missing_permissions);
-  const permissionLinks = rows(preview.permission_urls)
+  const permissionLinks = (permissions.length ? rows(preview.permission_urls) : [])
     .map((item) =>
       publicLink(item.url, item.name || "Grant cleanup permissions"),
     )
@@ -665,10 +665,15 @@ function renderCleanup() {
   const readGaps = rows(preview.read_gaps);
   const blocked =
     permissions.length > 0 || readGaps.length > 0 || preview.blocked === true;
+  const retryable = !!preview.snapshot_id && (
+    !!local.error || ["error", "partial", "failed", "interrupted"].includes(preview.status || local.result?.status)
+  );
   $("#cleanup-preview").innerHTML =
-    `${local.busy ? '<p class="quiet">Loading cleanup scope…</p>' : ""}${local.error ? `<p class="error">${text(local.error)}</p>` : ""}${preview.snapshot_id ? `<dl class="cleanup-scope"><div><dt>Guild</dt><dd>${text(preview.guild_id || "Unavailable")}</dd></div><div><dt>Scope</dt><dd>${text(preview.scope || "All guild messages and AI threads")}</dd></div><div><dt>Messages</dt><dd>${text(preview.message_count ?? "Unavailable")}</dd></div><div><dt>AI threads</dt><dd>${text(preview.thread_count ?? "Unavailable")}</dd></div></dl>` : ""}${permissions.length ? `<p class="error">Missing cleanup permissions ${text(permissions.join(", "))}</p>` : ""}${readGaps.length ? `<div class="error"><p>Cleanup is blocked because parts of the server could not be read.</p><ul>${readGaps.map((gap) => `<li>${text(gap)}</li>`).join("")}</ul></div>` : ""}${preview.blocked ? '<p class="error">The server blocked this cleanup preview.</p>' : ""}${permissionLinks.length ? `<div class="permission-links"><h3>Grant cleanup permissions</h3>${permissionLinks.join(" ")}</div>` : ""}${local.running ? '<p class="quiet" role="status">Cleanup is running. Progress refreshes automatically.</p>' : ""}${local.result ? `<details open><summary>Cleanup result</summary><pre>${text(local.result)}</pre></details>` : ""}${preview.snapshot_id && !blocked && !local.running && !local.result && !local.busy ? '<p class="cleanup-warning">The reviewed snapshot includes human messages. Deletion is permanent.</p><button class="danger-button" type="button" data-execute-cleanup>Clear server messages and AI threads</button>' : ""}`;
+    `${local.busy ? '<p class="quiet">Loading cleanup scope…</p>' : ""}${local.error ? `<p class="error">${text(local.error)}</p>` : ""}${preview.snapshot_id ? `<dl class="cleanup-scope"><div><dt>Guild</dt><dd>${text(preview.guild_id || "Unavailable")}</dd></div><div><dt>Scope</dt><dd>${text(preview.scope || "All guild messages and AI threads")}</dd></div><div><dt>Messages</dt><dd>${text(preview.message_count ?? "Unavailable")}</dd></div><div><dt>AI threads</dt><dd>${text(preview.thread_count ?? "Unavailable")}</dd></div></dl>` : ""}${permissions.length ? `<p class="error">Missing cleanup permissions ${text(permissions.join(", "))}</p>` : ""}${readGaps.length ? `<div class="error"><p>Cleanup is blocked because parts of the server could not be read.</p><ul>${readGaps.map((gap) => `<li>${text(gap)}</li>`).join("")}</ul></div>` : ""}${preview.blocked ? '<p class="error">The server blocked this cleanup preview.</p>' : ""}${permissionLinks.length ? `<div class="permission-links"><h3>Grant cleanup permissions</h3>${permissionLinks.join(" ")}</div>` : ""}${local.running ? '<p class="quiet" role="status">Cleanup is running. Progress refreshes automatically.</p>' : ""}${local.result ? `<details open><summary>Cleanup result</summary><pre>${text(local.result)}</pre></details>` : ""}${preview.snapshot_id && !blocked && !retryable && !local.running && !local.result && !local.busy ? '<p class="cleanup-warning">The reviewed snapshot includes human messages. Deletion is permanent.</p><button class="danger-button" type="button" data-execute-cleanup>Clear server messages and AI threads</button>' : ""}${retryable && !blocked && !local.running && !local.busy ? '<button class="danger-button" type="button" data-retry-cleanup>Retry same cleanup snapshot</button>' : ""}`;
 }
 async function reviewCleanup(instanceId) {
+  clearTimeout(cleanupTimers.get(instanceId));
+  cleanupTimers.delete(instanceId);
   cleanupStates.set(instanceId, { busy: true });
   renderCleanup();
   try {
@@ -678,11 +683,12 @@ async function reviewCleanup(instanceId) {
     const running =
       preview.running === true ||
       ["running", "queued", "in_progress"].includes(preview.status);
-    cleanupStates.set(instanceId, { preview, running, result: preview.result });
+    const snapshotId = preview.snapshot_id;
+    cleanupStates.set(instanceId, { preview, snapshotId, running, result: preview.result });
     if (running && !cleanupTimers.has(instanceId))
       cleanupTimers.set(
         instanceId,
-        setTimeout(() => pollCleanup(instanceId), 3000),
+        setTimeout(() => pollCleanup(instanceId, snapshotId), 3000),
       );
   } catch (error) {
     cleanupStates.set(instanceId, {
@@ -692,87 +698,69 @@ async function reviewCleanup(instanceId) {
   }
   if (selected === instanceId) renderCleanup();
 }
-async function pollCleanup(instanceId) {
+async function pollCleanup(instanceId, snapshotId) {
+  const before = cleanupStates.get(instanceId);
+  snapshotId ||= before?.snapshotId || before?.preview?.snapshot_id;
+  if (!snapshotId || (before?.snapshotId || before?.preview?.snapshot_id) !== snapshotId) return;
+  cleanupTimers.delete(instanceId);
   try {
     const response = await api(
-      `/api/cleanup/${encodeURIComponent(instanceId)}`,
+      `/api/cleanup/${encodeURIComponent(instanceId)}?snapshot_id=${encodeURIComponent(snapshotId)}`,
     );
-    const running =
-      response.running === true ||
-      ["running", "queued", "in_progress"].includes(
-        response.status || response.state,
-      );
     const local = cleanupStates.get(instanceId) || {};
+    if ((local.snapshotId || local.preview?.snapshot_id) !== snapshotId) return;
+    const running = response.running === true ||
+      ["running", "queued", "in_progress"].includes(response.status || response.state);
     cleanupStates.set(instanceId, {
       ...local,
+      snapshotId,
+      preview: { ...local.preview, ...response },
       running,
-      result:
-        response.result ||
-        (running
-          ? {
-              status: response.status || response.state,
-              progress: response.progress,
-            }
-          : response),
+      error: null,
+      result: response.result || (running
+        ? { status: response.status || response.state, progress: response.progress }
+        : response),
     });
-    if (running)
-      cleanupTimers.set(
-        instanceId,
-        setTimeout(() => pollCleanup(instanceId), 3000),
-      );
-    else {
-      cleanupTimers.delete(instanceId);
-      refresh();
-    }
+    if (running) cleanupTimers.set(instanceId, setTimeout(() => pollCleanup(instanceId, snapshotId), 3000));
   } catch (error) {
-    cleanupStates.set(instanceId, {
-      ...cleanupStates.get(instanceId),
-      running: false,
-      error: error.message,
-    });
+    const local = cleanupStates.get(instanceId) || {};
+    if ((local.snapshotId || local.preview?.snapshot_id) !== snapshotId) return;
+    cleanupStates.set(instanceId, { ...local, running: false, error: error.message });
+    cleanupTimers.delete(instanceId);
   }
   if (selected === instanceId) renderCleanup();
 }
-async function executeCleanup(instanceId) {
+async function executeCleanup(instanceId, resume = false) {
   const local = cleanupStates.get(instanceId);
-  if (
-    !local?.preview?.snapshot_id ||
-    local.running ||
-    local.busy ||
-    local.preview.blocked ||
-    rows(local.preview.missing_permissions).length ||
-    rows(local.preview.read_gaps).length
-  )
-    return;
-  cleanupStates.set(instanceId, { ...local, running: true });
+  const snapshotId = local?.snapshotId || local?.preview?.snapshot_id;
+  if (!snapshotId || local.running || local.busy || local.preview.blocked ||
+      rows(local.preview.missing_permissions).length || rows(local.preview.read_gaps).length) return;
+  clearTimeout(cleanupTimers.get(instanceId));
+  cleanupTimers.delete(instanceId);
+  cleanupStates.set(instanceId, { ...local, snapshotId, running: true, error: null });
   renderCleanup();
   try {
     const response = await api(
       `/api/cleanup/${encodeURIComponent(instanceId)}`,
-      { snapshot_id: local.preview.snapshot_id },
+      { snapshot_id: snapshotId, ...(resume ? { resume: true } : {}) },
     );
-    const running =
-      response.running === true ||
-      ["running", "queued", "in_progress"].includes(
-        response.status || response.state,
-      );
+    const currentLocal = cleanupStates.get(instanceId) || {};
+    if ((currentLocal.snapshotId || currentLocal.preview?.snapshot_id) !== snapshotId) return;
+    const running = response.running === true ||
+      ["running", "queued", "in_progress"].includes(response.status || response.state);
     cleanupStates.set(instanceId, {
-      ...local,
+      ...currentLocal,
+      snapshotId,
+      preview: { ...currentLocal.preview, ...response },
       running,
+      error: null,
       result: response.result || response,
     });
-    if (running)
-      cleanupTimers.set(
-        instanceId,
-        setTimeout(() => pollCleanup(instanceId), 3000),
-      );
-    else refresh();
+    if (running) cleanupTimers.set(instanceId, setTimeout(() => pollCleanup(instanceId, snapshotId), 3000));
   } catch (error) {
-    cleanupStates.set(instanceId, {
-      ...local,
-      error: error.message,
-      result: error.details,
-    });
+    const currentLocal = cleanupStates.get(instanceId) || {};
+    if ((currentLocal.snapshotId || currentLocal.preview?.snapshot_id) !== snapshotId) return;
+    cleanupStates.set(instanceId, { ...currentLocal, running: false, error: error.message, result: error.details || currentLocal.result });
   }
   if (selected === instanceId) renderCleanup();
 }
@@ -1084,6 +1072,7 @@ $("#project-search").addEventListener("input", renderProjects);
 $("#review-cleanup").addEventListener("click", () => reviewCleanup(selected));
 $("#cleanup-preview").addEventListener("click", (event) => {
   if (event.target.closest("[data-execute-cleanup]")) executeCleanup(selected);
+  if (event.target.closest("[data-retry-cleanup]")) executeCleanup(selected, true);
 });
 $("#metrics").innerHTML = '<div class="skeleton"></div>'.repeat(4);
 refresh();

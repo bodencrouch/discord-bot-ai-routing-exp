@@ -9,7 +9,7 @@ import uuid
 
 import discord
 
-from .bot import Together
+from .bot import Together, has_image_attachment
 
 
 def telemetry_value(value):
@@ -239,12 +239,35 @@ class HubTogether(Together):
     async def on_ready(self):
         self.emit("connection.ready", {"user_id": str(self.user.id)})
         await super().on_ready()
+        runtime = getattr(self, "hub_runtime", None)
+        if runtime:
+            await runtime.ensure_maintenance(self)
+        recover = getattr(self, "cleanup_recover", None)
+        if recover:
+            await recover()
+
+    async def on_guild_role_update(self, before, after):
+        # Permission grants via the OAuth link edit the bot's managed role, and
+        # admins may edit any role the bot holds. Role updates arrive under the
+        # default guilds intent (no members intent needed, unlike member updates).
+        refresh = getattr(self, "cleanup_permissions_changed", None)
+        if (
+            refresh
+            and str(after.guild.id) == str(self.config["guild_id"])
+            and before.permissions != after.permissions
+            and after.guild.me
+            and after in after.guild.me.roles
+        ):
+            await refresh(after.guild.id)
 
     async def on_disconnect(self):
         self.emit("connection.disconnected", {})
 
     async def on_message(self, message):
         if self.cleanup_running():
+            return
+        controller = getattr(self, "maintenance_controller", None)
+        if controller and await controller.handle_message(message):
             return
         if getattr(self, "hub_runtime", None):
             self.hub_runtime.dispatch_components(self.instance["id"], message)
@@ -274,22 +297,40 @@ class HubTogether(Together):
             },
         )
         if self.instance.get("dry_run"):
-            directed = self.user in message.mentions or (
-                message.reference
-                and isinstance(message.reference.resolved, discord.Message)
-                and message.reference.resolved.author.id == self.user.id
+            in_thread = isinstance(message.channel, discord.Thread) and (
+                message.channel.owner_id == self.user.id
+                or self.store.conversation(str(message.channel.id))
+            )
+            public_channel = isinstance(message.channel, discord.TextChannel) and (
+                message.channel.permissions_for(message.guild.default_role).view_channel
+            )
+            directed = (
+                in_thread
+                or self.user in message.mentions
+                or (
+                    message.reference
+                    and isinstance(message.reference.resolved, discord.Message)
+                    and message.reference.resolved.author.id == self.user.id
+                )
             )
             if directed:
                 prompt = re.sub(rf"<@!?{self.user.id}>", "", message.content).strip()
+                if not prompt and has_image_attachment(message):
+                    prompt = "Describe the attached image."
                 if prompt:
-                    await self.run_turn(
-                        message.channel,
-                        prompt,
-                        message.author,
-                        message.reply,
-                        source_id=message.id,
-                    )
-            else:
+                    try:
+                        await self.run_turn(
+                            message.channel,
+                            prompt,
+                            message.author,
+                            message.reply,
+                            source_id=message.id,
+                        )
+                    except Exception as error:
+                        await message.reply(
+                            "I couldn't prepare that draft. " + self.error_text(error)
+                        )
+            elif public_channel:
                 self.schedule_ambient(message)
             return
         await super().on_message(message)
@@ -357,14 +398,38 @@ class HubTogether(Together):
         try:
             if self.instance.get("dry_run"):
                 async with self.room_locks.setdefault(str(channel.id), asyncio.Lock()):
+                    source = None
+                    if source_id:
+                        try:
+                            source = await channel.fetch_message(int(source_id))
+                        except discord.NotFound:
+                            return None
+                    context = (
+                        self.store.history(
+                            str(channel.id), exclude_source=source_id, with_sources=True
+                        )
+                        if history is None
+                        else history
+                    )
+                    budget = {"bytes": 16 * 1024 * 1024}
+                    images = (
+                        await self.source_image_parts(
+                            channel, source.id, budget, source=source, refresh=True
+                        )
+                        if source
+                        else []
+                    )
+                    context = await self.image_history(channel, context, budget)
                     selected, answer, _ = await self.engine.ask(
                         str(channel.id),
                         prompt,
                         author.display_name,
                         model=model,
                         skill=skill,
-                        history=history,
+                        history=context,
+                        images=images,
                         persist=False,
+                        casual=not isinstance(channel, discord.Thread),
                         ambient=ambient,
                         participation=self.participation(str(channel.id))["level"],
                     )
@@ -463,6 +528,9 @@ class HubTogether(Together):
             self.turn_tasks.discard(task)
 
     async def close(self):
+        controller = getattr(self, "maintenance_controller", None)
+        if controller:
+            await controller.close()
         pending = [
             task for task in self.turn_tasks if task is not asyncio.current_task()
         ]
@@ -474,6 +542,9 @@ class HubTogether(Together):
     async def on_raw_message_edit(self, event):
         if self.cleanup_running():
             return
+        controller = getattr(self, "maintenance_controller", None)
+        if controller:
+            await controller.on_raw_message_edit(event)
         try:
             if not self.instance.get("dry_run"):
                 channel = self.get_channel(event.channel_id)
@@ -486,6 +557,9 @@ class HubTogether(Together):
     async def on_raw_message_delete(self, event):
         if self.cleanup_running():
             return
+        controller = getattr(self, "maintenance_controller", None)
+        if controller:
+            await controller.on_raw_message_delete(event)
         try:
             if not self.instance.get("dry_run"):
                 await super().on_raw_message_delete(event)
@@ -500,6 +574,14 @@ class HubTogether(Together):
     async def on_raw_bulk_message_delete(self, event):
         if self.cleanup_running():
             return
+        controller = getattr(self, "maintenance_controller", None)
+        if controller:
+            from types import SimpleNamespace
+
+            for message_id in event.message_ids:
+                await controller.on_raw_message_delete(
+                    SimpleNamespace(message_id=message_id)
+                )
         try:
             if not self.instance.get("dry_run"):
                 await super().on_raw_bulk_message_delete(event)

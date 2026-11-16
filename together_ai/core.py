@@ -85,9 +85,9 @@ class Store:
             if "anchor_id" not in turn_columns:
                 self.db.execute("ALTER TABLE turns ADD COLUMN anchor_id TEXT")
 
-    def history(self, room, exclude_source=None, exclude_turn=None):
+    def history(self, room, exclude_source=None, exclude_turn=None, with_sources=False):
         rows = self.db.execute(
-            "SELECT role,content FROM messages WHERE room=? AND (? IS NULL OR source_id IS NULL OR source_id!=?) AND (? IS NULL OR turn_key IS NULL OR turn_key!=?) ORDER BY id",
+            "SELECT role,content,source_id FROM messages WHERE room=? AND (? IS NULL OR source_id IS NULL OR source_id!=?) AND (? IS NULL OR turn_key IS NULL OR turn_key!=?) ORDER BY id",
             (
                 room,
                 str(exclude_source) if exclude_source else None,
@@ -96,7 +96,13 @@ class Store:
                 exclude_turn,
             ),
         )
-        return [dict(role=r, content=c) for r, c in rows]
+        result = []
+        for role, content, source_id in rows:
+            message = {"role": role, "content": content}
+            if with_sources:
+                message["source_id"] = source_id
+            result.append(message)
+        return result
 
     def append(self, room, prompt, answer):
         with self.db:
@@ -455,6 +461,7 @@ class Engine:
         skill=None,
         *,
         history=None,
+        images=None,
         persist=True,
         casual=False,
         ambient=False,
@@ -527,10 +534,24 @@ class Engine:
                 system += "\nRequested skill guidance\n" + self.skills[skill]
             utterance = f"{user}: {prompt}"
             context = self.store.history(room) if history is None else history
+            content = (
+                ([{"type": "text", "text": utterance}] + images)
+                if images
+                else utterance
+            )
             messages = (
                 [{"role": "system", "content": system}]
                 + context
-                + [{"role": "user", "content": utterance}]
+                + [{"role": "user", "content": content}]
+            )
+            image_input = any(
+                isinstance(message.get("content"), list)
+                and any(
+                    part.get("type") == "image_url"
+                    for part in message["content"]
+                    if isinstance(part, dict)
+                )
+                for message in messages
             )
             tools = [
                 {
@@ -556,6 +577,10 @@ class Engine:
                         break
                     await asyncio.sleep(1)
                 if not response.is_success:
+                    if image_input and response.status_code in {400, 415, 422}:
+                        raise RuntimeError(
+                            "This AI route rejected image input. Select a vision-capable route and retry."
+                        )
                     raise RuntimeError(
                         f"AI provider returned HTTP {response.status_code}. Try another model or retry shortly."
                     )

@@ -40,7 +40,9 @@ class CleanupManager:
     def __init__(self, runtime, state):
         self.runtime, self.state = runtime, state
         self.locks = {}
+        self.ui_locks = {}
         self.running = set()
+        self.reservations = {}  # guild_id -> snapshot_id claimed but maybe not yet run
         self.tasks = {}
         self.active_runs = set()
         with state.lock, state.db:
@@ -59,6 +61,336 @@ class CleanupManager:
 
     def is_running(self, guild_id):
         return str(guild_id) in self.running
+
+    # Control messages are tracked so consumed or superseded previews retire
+    # (disabled) even across restarts. Snapshot IDs never change.
+    def _controls(self, guild_id):
+        with self.state.lock:
+            self.state.db.execute(
+                "CREATE TABLE IF NOT EXISTS hub_cleanup_controls (message_id TEXT PRIMARY KEY,guild_id TEXT,channel_id TEXT,snapshot_id TEXT,owner_id TEXT,state TEXT DEFAULT 'active')"
+            )
+            return [
+                dict(row)
+                for row in self.state.db.execute(
+                    "SELECT * FROM hub_cleanup_controls WHERE guild_id=?",
+                    (str(guild_id),),
+                ).fetchall()
+            ]
+
+    def track_control(self, message, snapshot_id=None, guild_id=None):
+        """Persist regular or webhook control cards with their owning bot."""
+        channel = getattr(message, "channel", None)
+        channel_id = getattr(channel, "id", None) or getattr(
+            message, "channel_id", None
+        )
+        guild = getattr(message, "guild", None) or getattr(channel, "guild", None)
+        if guild_id is None and guild is not None:
+            guild_id = guild.id
+        if guild_id is None and channel_id is not None:
+            for client in self.runtime.clients.values():
+                cached = client.get_channel(int(channel_id))
+                cached_guild = getattr(cached, "guild", None)
+                if cached_guild is not None:
+                    guild_id = cached_guild.id
+                    break
+        if guild_id is None:
+            raise ValueError("A guild ID is required to track this cleanup control.")
+        if channel_id is None:
+            raise ValueError("A channel ID is required to track this cleanup control.")
+        self._controls(guild_id)
+        with self.state.lock, self.state.db:
+            self.state.db.execute(
+                "INSERT OR REPLACE INTO hub_cleanup_controls VALUES (?,?,?,?,?,'active')",
+                (
+                    str(message.id),
+                    str(guild_id),
+                    str(channel_id),
+                    snapshot_id,
+                    str(message.author.id),
+                ),
+            )
+
+    def _set_control_state(self, message_id, state):
+        with self.state.lock, self.state.db:
+            if state == "gone":
+                self.state.db.execute(
+                    "DELETE FROM hub_cleanup_controls WHERE message_id=?",
+                    (str(message_id),),
+                )
+            else:
+                self.state.db.execute(
+                    "UPDATE hub_cleanup_controls SET state=? WHERE message_id=?",
+                    (state, str(message_id)),
+                )
+
+    def _owner_client(self, owner_id):
+        for client in self.runtime.clients.values():
+            if client.user and str(client.user.id) == str(owner_id):
+                return client
+        return None
+
+    async def refresh_control(self, row, label=None, retire=True):
+        """Edit one card through its own bot identity. Returns True when settled."""
+        client = self._owner_client(row.get("owner_id"))
+        if client is None or not client.is_ready():
+            return False  # Owner offline: keep tracking for a later retry.
+        try:
+            channel = client.get_channel(int(row["channel_id"]))
+            if channel is None:
+                channel = await client.fetch_channel(int(row["channel_id"]))
+            message = await channel.fetch_message(int(row["message_id"]))
+            if retire:
+                view = discord.ui.View.from_message(message, timeout=None)
+                for item in list(view.children):
+                    if getattr(item, "url", None):
+                        view.remove_item(item)  # Obsolete permission links go.
+                    else:
+                        item.disabled = True
+                        if label:
+                            item.label = label
+                await message.edit(view=view)
+                self._set_control_state(row["message_id"], "retired")
+            else:
+                await message.edit(view=status_view(client, self.runtime))
+            return True
+        except discord.NotFound:
+            self._set_control_state(row["message_id"], "gone")
+            return True
+        except (discord.HTTPException, AttributeError):
+            return False  # 403/5xx: retain tracking so a retry can settle it.
+
+    async def retire_controls(self, guild_id, keep=None, label=None):
+        """Retire every active control card except `keep`, via each owner bot."""
+        for row in self._controls(guild_id):
+            if row["message_id"] == str(keep) or row.get("state") == "retired":
+                continue
+            await self.refresh_control(row, label=label)
+
+    def capable_client(self, guild_id):
+        """The connected identity that will execute cleanup: the one with the
+        most cleanup permissions. Cleanup is a shared operation, so a grant on
+        ANY capable connected bot is enough; no per-identity grant is needed."""
+        clients = self.clients(guild_id)
+        if not clients:
+            return None
+        return max(
+            clients,
+            key=lambda item: (
+                item.get_guild(int(guild_id)).me.guild_permissions.manage_threads,
+                item.get_guild(int(guild_id)).me.guild_permissions.manage_messages,
+            ),
+        )
+
+    @staticmethod
+    def required_permissions(data):
+        """Derive what a snapshot NEEDS from its immutable rooms, independent
+        of what was held at review time: any message requires Manage Messages,
+        any AI thread requires Manage Threads. A snapshot reviewed while the
+        permissions were held therefore still reports a deficit after
+        revocation (legacy/empty required_permissions fields are repaired)."""
+        rooms = data.get("rooms") or []
+        needs = []
+        if any(room.get("messages") for room in rooms):
+            needs.append("Manage Messages")
+        if any(room.get("ai_thread") for room in rooms):
+            needs.append("Manage Threads")
+        if "rooms" not in data:  # Public copies retain their persisted needs.
+            needs = list(data.get("required_permissions") or [])
+        for gap in data.get("read_gaps", []):
+            if (
+                "thread" in gap.get("reason", "").lower()
+                and "Manage Threads" not in needs
+            ):
+                needs.append("Manage Threads")
+        return needs
+
+    def permission_deficit(self, guild_id, data):
+        """Recompute which cleanup permissions the executing bot lacks, from
+        the snapshot's derived needs. Recomputing (not filtering the old
+        missing list) catches permissions revoked since the review."""
+        needs = self.required_permissions(data)
+        client = self.capable_client(guild_id)
+        if client is None:
+            return list(needs)
+        perms = client.get_guild(int(guild_id)).me.guild_permissions
+        held = {
+            "Manage Messages": perms.manage_messages,
+            "Manage Threads": perms.manage_threads,
+        }
+        return [name for name in needs if not held.get(name, True)]
+
+    async def revalidate(self, data):
+        """Recheck real access for a saved preview and persist the result so
+        cards and `claim` agree on one validated state.
+
+        * missing_permissions is RECOMPUTED against the capable bot (grants and
+          revocations both reflected).
+        * read_gaps are NEVER cleared here. The rooms list is immutable; a
+          permission flag becoming readable does not populate the messages or
+          private threads that were missed. Those gaps clear only when a fresh
+          review inventories the scope. The card shows "Review again" instead
+          of a permission link once the underlying access is actually held.
+        * permission_urls are rebuilt to point only at the capable bot and only
+          while a real permission deficit exists."""
+        guild_id = data["guild_id"]
+        client = self.capable_client(guild_id)
+        if client is None:
+            return data
+        data["required_permissions"] = self.required_permissions(data)
+        data["missing_permissions"] = self.permission_deficit(guild_id, data)
+        # A read gap that needed Manage Threads is "access granted" once the
+        # capable bot holds it; it still requires a fresh review to inventory.
+        perms = client.get_guild(int(guild_id)).me.guild_permissions
+        for gap in data.get("read_gaps", []):
+            gap["access_granted"] = bool(
+                perms.manage_threads
+                if "Manage Threads" in gap["reason"]
+                else self._room_readable(client, guild_id, gap["channel_id"])
+            )
+        data["permission_urls"] = (
+            [
+                {
+                    "name": client.user.display_name,
+                    "url": permissions_url(client.user.id, guild_id),
+                }
+            ]
+            if data["missing_permissions"]
+            else []
+        )
+        self._save(data)
+        return data
+
+    def _room_readable(self, client, guild_id, channel_id):
+        guild = client.get_guild(int(guild_id))
+        channel = guild.get_channel_or_thread(int(channel_id))
+        if channel is None:
+            return False
+        room_perms = channel.permissions_for(guild.me)
+        return bool(room_perms.view_channel and room_perms.read_message_history)
+
+    async def refresh_permission_cards(self, guild_id):
+        """Rebuild active cards when permissions change or on startup, using
+        the same validated snapshot state `start` will check."""
+        for row in self._controls(guild_id):
+            if row.get("state") == "retired":
+                continue
+            if row.get("snapshot_id"):
+                snapshot = self._get(row["snapshot_id"])
+                if snapshot and snapshot.get("status") in {
+                    "preview",
+                    "partial",
+                    "failed",
+                    "interrupted",
+                }:
+                    snapshot = await self.revalidate(snapshot)
+                    await self._edit_preview(row, snapshot)
+                else:
+                    label = (
+                        "Cleanup is running"
+                        if snapshot and snapshot.get("status") == "running"
+                        else "Cleanup complete"
+                        if snapshot and snapshot.get("status") == "complete"
+                        else "This cleanup review is no longer current"
+                    )
+                    await self.refresh_control(row, label=label)
+                continue
+            await self.refresh_control(row, retire=False)
+
+    async def claim(self, guild_id, actor_id, snapshot_id, resume=False):
+        """Central confirm/retry claim. Serialized per guild by the UI lock.
+        Validates then persists 'running' atomically; on any rejection the
+        snapshot keeps its prior status (no phantom running state)."""
+        guild_id = str(guild_id)
+        ui_lock = self.ui_locks.setdefault(guild_id, asyncio.Lock())
+        async with ui_lock:
+            data = self._get(snapshot_id)
+            if not data or data["guild_id"] != guild_id:
+                raise ValueError("Review a cleanup snapshot for this server first.")
+            allowed = {"partial", "failed", "interrupted"} if resume else {"preview"}
+            if data.get("status") not in allowed:
+                raise ValueError(
+                    "That cleanup preview is no longer current. Review the server again."
+                )
+            if self.is_running(guild_id):
+                raise ValueError("Server cleanup is already running.")
+            data = await self.revalidate(data)
+            if data.get("missing_permissions") or data.get("read_gaps"):
+                raise ValueError(
+                    "Enable cleanup permissions, then review the server again."
+                )
+            if not self.clients(guild_id):
+                raise ValueError("The server bot is disconnected.")
+            previous_status = data.get("status")
+            # Reserve the guild INSIDE the lock, before scheduling, so a
+            # concurrent claim sees is_running() and is rejected above.
+            self.running.add(guild_id)
+            self.reservations[guild_id] = snapshot_id
+            data.update(status="running", running=True, actor_id=str(actor_id))
+            try:
+                self._save(data)
+                task = asyncio.create_task(
+                    self.run(guild_id, actor_id, expected_snapshot=snapshot_id)
+                )
+            except BaseException:
+                # Scheduling failed: roll back the reservation and prior status.
+                self.running.discard(guild_id)
+                self.reservations.pop(guild_id, None)
+                data.update(status=previous_status, running=False)
+                self._save(data)
+                raise
+            self.tasks[guild_id] = task
+            task.add_done_callback(self._finished)
+            return task
+
+    async def _edit_preview(self, row, snapshot):
+        client = self._owner_client(row.get("owner_id"))
+        try:
+            channel = client.get_channel(int(row["channel_id"])) or (
+                await client.fetch_channel(int(row["channel_id"]))
+            )
+            message = await channel.fetch_message(int(row["message_id"]))
+            view = (
+                preview_view(self.public(snapshot))
+                if snapshot.get("status") == "preview"
+                else retry_view(
+                    client, self.runtime, snapshot["guild_id"], snapshot["snapshot_id"]
+                )
+            )
+            await message.edit(view=view)
+        except discord.NotFound:
+            self._set_control_state(row["message_id"], "gone")
+        except (discord.HTTPException, AttributeError):
+            pass
+
+    def supersede_previews(self, guild_id, keep_snapshot):
+        """Persist 'superseded' on older unconfirmed previews so the backend
+        rejects their confirm buttons even after a restart."""
+        with self.state.lock, self.state.db:
+            rows = self.state.db.execute(
+                "SELECT id,data FROM hub_cleanups WHERE guild_id=?", (str(guild_id),)
+            ).fetchall()
+            for row in rows:
+                data = json.loads(row["data"])
+                if row["id"] != keep_snapshot and data.get("status") == "preview":
+                    data["status"] = "superseded"
+                    self.state.db.execute(
+                        "UPDATE hub_cleanups SET data=? WHERE id=?",
+                        (json.dumps(data), row["id"]),
+                    )
+
+    def resumable(self, guild_id):
+        """Snapshots whose run stopped before completion (partial/failed/
+        interrupted). Each keeps its original ID and saved deletion progress."""
+        with self.state.lock:
+            rows = self.state.db.execute(
+                "SELECT data FROM hub_cleanups WHERE guild_id=? ORDER BY rowid",
+                (str(guild_id),),
+            ).fetchall()
+        return [
+            data
+            for data in (json.loads(row["data"]) for row in rows)
+            if data.get("status") in {"partial", "failed", "interrupted"}
+        ]
 
     def _save(self, data):
         with self.state.lock, self.state.db:
@@ -96,9 +428,20 @@ class CleanupManager:
         ]
 
     async def preview(self, guild_id):
+        """Central preview entrypoint for buttons, /cleanup and the dashboard.
+        Serialized per guild; supersedes older previews and retires their cards
+        inside the same critical section so no stale card can be confirmed."""
         guild_id = str(guild_id)
-        if self.is_running(guild_id):
-            return self.latest(guild_id)
+        ui_lock = self.ui_locks.setdefault(guild_id, asyncio.Lock())
+        async with ui_lock:
+            if self.is_running(guild_id):
+                return self.latest(guild_id)
+            data = await self._inventory(guild_id)
+            self.supersede_previews(guild_id, data["snapshot_id"])
+            await self.retire_controls(guild_id, label="Superseded by a newer review")
+            return data
+
+    async def _inventory(self, guild_id):
         clients = self.clients(guild_id)
         if not clients:
             raise ValueError("A bot must be connected to this server first.")
@@ -218,13 +561,18 @@ class CleanupManager:
             "message_count": sum(len(room["messages"]) for room in inventory),
             "thread_count": sum(room["ai_thread"] for room in inventory),
             "missing_permissions": missing,
+            "required_permissions": self.required_permissions(
+                {"rooms": inventory, "read_gaps": gaps}
+            ),
+            # Cleanup is a shared operation: one link, for the capable bot only.
             "permission_urls": [
                 {
-                    "name": item.user.display_name,
-                    "url": permissions_url(item.user.id, guild_id),
+                    "name": client.user.display_name,
+                    "url": permissions_url(client.user.id, guild_id),
                 }
-                for item in clients
-            ],
+            ]
+            if missing
+            else [],
             "read_gaps": gaps,
             "rooms": inventory,
             "status": "preview",
@@ -233,27 +581,30 @@ class CleanupManager:
         self._save(data)
         return self.public(data)
 
-    def start(self, guild_id, actor_id, snapshot_id):
-        data = self._get(snapshot_id)
-        if not data or data["guild_id"] != str(guild_id):
-            raise ValueError("Review a cleanup snapshot for this server first.")
-        if data.get("missing_permissions") or data.get("read_gaps"):
-            raise ValueError(
-                "Enable cleanup permissions, then review the server again."
-            )
-        task = self.tasks.get(str(guild_id))
-        if task and not task.done():
-            raise ValueError("Server cleanup is already running.")
-        task = asyncio.create_task(
-            self.run(guild_id, actor_id, expected_snapshot=snapshot_id)
-        )
-        self.tasks[str(guild_id)] = task
-        task.add_done_callback(self._finished)
-        return task
+    async def start(self, guild_id, actor_id, snapshot_id, resume=False):
+        """Central start entrypoint (dashboard and buttons). Delegates to the
+        serialized claim so an older preview can never execute."""
+        return await self.claim(guild_id, actor_id, snapshot_id, resume=resume)
 
     def _finished(self, task):
+        """Task-done reconciliation. If a run exits before (or without) reaching
+        its own finally block (e.g. cancelled while waiting on the run lock),
+        clear the reservation and persist a resumable status so no snapshot is
+        stranded as 'running'."""
         if not task.cancelled():
             task.exception()
+        for guild_id, snapshot_id in list(self.reservations.items()):
+            if self.tasks.get(guild_id) is not task:
+                continue
+            self.reservations.pop(guild_id, None)
+            self.running.discard(guild_id)
+            data = self._get(snapshot_id)
+            if data and data.get("status") == "running":
+                data.update(
+                    status="interrupted" if task.cancelled() else "failed",
+                    running=False,
+                )
+                self._save(data)
 
     async def run(self, guild_id, actor_id, expected_snapshot=None, progress=None):
         guild_id = str(guild_id)
@@ -266,10 +617,23 @@ class CleanupManager:
                 )
             if data.get("status") == "complete":
                 return data["result"]
+            # The UI claims a snapshot by persisting 'running' before starting
+            # this task; anything else marked running belongs to another run.
+            if data.get("status") == "superseded" or (
+                data.get("status") == "running"
+                and data.get("actor_id") not in (None, str(actor_id))
+            ):
+                raise ValueError(
+                    "That cleanup preview is no longer current. Review the server again."
+                )
             if data.get("missing_permissions") or data.get("read_gaps"):
                 raise ValueError(
                     "Grant the missing cleanup permissions, then review a fresh snapshot."
                 )
+            # Every control card (from either bot, disabled or not) belongs to the
+            # operation itself and never counts as newer human activity.
+            control_ids = {row["message_id"] for row in self._controls(guild_id)}
+            bot_ids = {str(item.user.id) for item in self.clients(guild_id)}
             clients = self.clients(guild_id)
             if not clients:
                 raise ValueError("The server bot is disconnected.")
@@ -295,7 +659,7 @@ class CleanupManager:
                 status="running", running=True, actor_id=str(actor_id), result=result
             )
             self._save(data)
-            self.running.add(guild_id)
+            self.running.add(guild_id)  # idempotent; claim() already reserved
             self.active_runs.add(asyncio.current_task())
             try:
                 await self._quiesce(clients)
@@ -374,7 +738,12 @@ class CleanupManager:
                     if room["ai_thread"] and room["id"] not in deleted_threads:
                         try:
                             removed = await self._delete_thread(
-                                client, room, data["cutoff_id"]
+                                client,
+                                room,
+                                data["cutoff_id"],
+                                control_ids=control_ids,
+                                bot_ids=bot_ids,
+                                errors=result["errors"],
                             )
                             if removed:
                                 deleted_threads.add(room["id"])
@@ -449,27 +818,45 @@ class CleanupManager:
                     if hasattr(item, "wake"):
                         item.wake.set()
 
-    async def _delete_thread(self, client, room, cutoff_id):
+    async def _delete_thread(
+        self, client, room, cutoff_id, control_ids=(), bot_ids=(), errors=None
+    ):
+        errors = errors if errors is not None else []
         thread_id = int(room["id"])
         current = await client.http.get_channel(thread_id)
         metadata = current.get("thread_metadata", {})
-        await client.http.edit_channel(
-            thread_id,
-            archived=True,
-            locked=True,
-            reason="Freeze an AI thread during confirmed cleanup",
-        )
+        original = {
+            "archived": bool(metadata.get("archived")),
+            "locked": bool(metadata.get("locked")),
+        }
         removed = False
         try:
+            # Discord rejects other edits on archived threads (50083): unarchive
+            # alone first. A locked but unarchived thread still accepts posts, so
+            # the real freeze is archived+locked before newer activity is checked.
+            if original["archived"]:
+                await client.http.edit_channel(
+                    thread_id,
+                    archived=False,
+                    reason="Unarchive an AI thread for cleanup",
+                )
+            await client.http.edit_channel(
+                thread_id,
+                archived=True,
+                locked=True,
+                reason="Freeze an AI thread during confirmed cleanup",
+            )
             newer = await client.http.logs_from(
                 thread_id, limit=100, after=int(cutoff_id)
             )
-            # Cleanup controls belong to the operation itself. Other new posts survive.
+            # Cleanup controls from either bot identity belong to the operation
+            # itself. Other new posts (humans, Issue 5, verification chat) survive.
             fresh = [
                 message
                 for message in newer
-                if not (
-                    message.get("author", {}).get("id") == str(client.user.id)
+                if message.get("id") not in control_ids
+                and not (
+                    message.get("author", {}).get("id") in bot_ids
                     and any(
                         component.get("custom_id", "").startswith("cleanup:")
                         for row in message.get("components", [])
@@ -486,15 +873,41 @@ class CleanupManager:
             return True
         finally:
             if not removed:
+                # Runs on failure and cancellation. Unarchive alone first, then
+                # reapply the original lock/archive state in the allowed order.
+                restore_task = asyncio.create_task(
+                    self._restore_thread(client, thread_id, original, errors)
+                )
                 try:
-                    await client.http.edit_channel(
-                        thread_id,
-                        archived=metadata.get("archived", False),
-                        locked=metadata.get("locked", False),
-                        reason="Restore a surviving thread after cleanup",
-                    )
-                except discord.NotFound:
-                    pass
+                    await asyncio.shield(restore_task)
+                except asyncio.CancelledError:
+                    # The shield Future is cancelled; join the real task so
+                    # restoration finishes before cancellation propagates.
+                    await restore_task
+                    raise
+
+    async def _restore_thread(self, client, thread_id, original, errors):
+        try:
+            await client.http.edit_channel(
+                thread_id, archived=False, reason="Restore a surviving thread"
+            )
+            await client.http.edit_channel(
+                thread_id,
+                locked=original["locked"],
+                archived=original["archived"],
+                reason="Restore a surviving thread after cleanup",
+            )
+        except discord.NotFound:
+            pass
+        except discord.HTTPException as error:
+            errors.append(
+                {
+                    "channel_id": str(thread_id),
+                    "operation": "restore_thread",
+                    "status": error.status,
+                    "original": original,
+                }
+            )
 
     async def _quiesce(self, clients):
         host_ids = {item.instance["id"] for item in clients}
@@ -615,16 +1028,20 @@ class CleanupManager:
 
 class CleanupButton(
     discord.ui.DynamicItem[discord.ui.Button],
-    template=r"cleanup:(?P<guild>\d+):(?P<snapshot>[a-f0-9]+|new):(?P<action>review|confirm)",
+    template=r"cleanup:(?P<guild>\d+):(?P<snapshot>[a-f0-9]+|new):(?P<action>review|confirm|retry)",
 ):
+    LABELS = {
+        "confirm": "Clear server messages and AI threads",
+        "retry": "Retry cleanup (same snapshot)",
+        "review": "Review server cleanup",
+    }
+
     def __init__(self, guild_id, snapshot_id="new", action="review"):
         super().__init__(
             discord.ui.Button(
-                label="Clear server messages and AI threads"
-                if action == "confirm"
-                else "Review server cleanup",
+                label=self.LABELS[action],
                 style=discord.ButtonStyle.danger
-                if action == "confirm"
+                if action in {"confirm", "retry"}
                 else discord.ButtonStyle.secondary,
                 custom_id=f"cleanup:{guild_id}:{snapshot_id}:{action}",
             )
@@ -649,43 +1066,131 @@ class CleanupButton(
             )
             return
         runtime = interaction.client.hub_runtime
-        await interaction.response.defer(thinking=True)
-        try:
-            if self.action == "review":
-                preview = await runtime.cleanup.preview(self.guild_id)
+        manager = runtime.cleanup
+        client = interaction.client
+        if manager.is_running(self.guild_id):
+            await interaction.response.send_message(
+                "Server cleanup is already running. Wait for it to finish.",
+                ephemeral=True,
+            )
+            return
+        if self.action != "review" and client.instance.get("dry_run"):
+            await interaction.response.send_message(
+                "This instance is in dry run. Use a live instance for cleanup.",
+                ephemeral=True,
+            )
+            return
+        # Retire the CLICKED card immediately (legacy untracked cards included).
+        # All lock-protected work happens inside the manager entrypoints below;
+        # this callback never holds the guild lock itself (no re-entrancy).
+        await disable_message(interaction, remove_links=True)
+        manager._set_control_state(interaction.message.id, "retired")
+        if self.action == "review":
+            try:
+                preview = await manager.preview(self.guild_id)
+            except (ValueError, discord.HTTPException) as error:
                 await interaction.followup.send(
-                    content=preview_text(preview), view=preview_view(preview)
+                    str(error)
+                    if isinstance(error, ValueError)
+                    else "Discord could not inventory the server. Check cleanup permissions.",
+                    view=status_view(client, runtime),
                 )
-            else:
-                if interaction.client.instance.get("dry_run"):
-                    raise ValueError(
-                        "This instance is in dry run. Use a live instance for cleanup."
-                    )
-                result = await asyncio.shield(
-                    runtime.cleanup.start(
-                        self.guild_id, interaction.user.id, self.snapshot_id
-                    )
-                )
-                content = f"Cleanup finished. {result['deleted_messages']} messages and {result['deleted_threads']} AI threads removed. {len(result['errors'])} operation errors recorded."
-                if result.get("preserved_threads"):
-                    content += f" {len(result['preserved_threads'])} threads with newer activity were preserved."
-                try:
-                    await interaction.followup.send(
-                        content, view=status_view(interaction.client, runtime)
-                    )
-                except discord.NotFound:
-                    parent = getattr(interaction.channel, "parent", None)
-                    if parent:
-                        await parent.send(
-                            content, view=status_view(interaction.client, runtime)
-                        )
-        except (ValueError, discord.HTTPException) as error:
+                return
+            await publish_preview(interaction, manager, preview)
+            return
+        # confirm / retry: claim is validated + serialized inside the manager.
+        try:
+            task = await manager.start(
+                self.guild_id,
+                interaction.user.id,
+                self.snapshot_id,
+                resume=self.action == "retry",
+            )
+        except ValueError as error:
             await interaction.followup.send(
+                f"{error}", view=status_view(client, runtime), ephemeral=True
+            )
+            return
+        await manager.retire_controls(self.guild_id, label="Cleanup started")
+        snapshot_ref = None  # complete result cards carry no snapshot
+        try:
+            result = await asyncio.shield(task)
+            content = f"Cleanup finished. {result['deleted_messages']} messages and {result['deleted_threads']} AI threads removed. {len(result['errors'])} operation errors recorded."
+            if result.get("preserved_threads"):
+                content += f" {len(result['preserved_threads'])} threads with newer activity were preserved."
+            view = status_view(client, runtime)
+            if result["errors"]:
+                content += " Use Retry cleanup to resume the same snapshot."
+                view = retry_view(client, runtime, self.guild_id, self.snapshot_id)
+                snapshot_ref = self.snapshot_id
+        except (ValueError, discord.HTTPException) as error:
+            content = (
                 str(error)
                 if isinstance(error, ValueError)
-                else "Discord refused part of the cleanup. Review the dashboard result.",
-                view=status_view(interaction.client, runtime),
+                else "Discord refused part of the cleanup. Use Retry cleanup to resume."
             )
+            view = retry_view(client, runtime, self.guild_id, self.snapshot_id)
+            snapshot_ref = self.snapshot_id
+        try:
+            sent = await interaction.followup.send(content, view=view, wait=True)
+        except discord.NotFound:
+            parent = getattr(interaction.channel, "parent", None) or interaction.channel
+            sent = await parent.send(content, view=view)
+        manager.track_control(sent, snapshot_ref, guild_id=interaction.guild_id)
+
+
+async def publish_preview(interaction, manager, preview):
+    """Post a preview card, track it, and retire it at once if a newer preview
+    (from any entrypoint or bot) already superseded it while we were sending."""
+    sent = await interaction.followup.send(
+        content=preview_text(preview), view=preview_view(preview), wait=True
+    )
+    manager.track_control(sent, preview["snapshot_id"], guild_id=interaction.guild_id)
+    current = manager._get(preview["snapshot_id"])
+    if current and not current.get("channel_id"):
+        # Remember where this snapshot lives so restart recovery can post a
+        # Retry card even after every source card has been retired.
+        current["channel_id"] = str(sent.channel.id)
+        manager._save(current)
+    if not current or current.get("status") != "preview":
+        for row in manager._controls(preview["guild_id"]):
+            if row["message_id"] == str(sent.id):
+                await manager.refresh_control(row, label="Superseded by a newer review")
+
+
+async def disable_message(interaction, remove_links=False):
+    """Retire the clicked card in place: disable buttons, drop permission links.
+    Works for legacy cards that were never tracked. Always leaves the
+    interaction acknowledged so a followup can be sent."""
+    try:
+        view = discord.ui.View.from_message(interaction.message, timeout=None)
+        for item in list(view.children):
+            if getattr(item, "url", None):
+                if remove_links:
+                    view.remove_item(item)
+            else:
+                item.disabled = True
+        await interaction.response.edit_message(view=view)
+    except (discord.HTTPException, AttributeError):
+        pass
+    if not interaction.response.is_done():
+        await interaction.response.defer(thinking=True)
+
+
+def retry_view(client, runtime, guild_id, snapshot_id):
+    """Retry resumes the SAME immutable snapshot with saved deletion progress."""
+    view = status_view(client, runtime)
+    view.add_item(CleanupButton(guild_id, snapshot_id, "retry"))
+    return view
+
+
+def permissions_granted(client, guild_id):
+    guild = client.get_guild(int(guild_id)) if client.user else None
+    return bool(
+        guild
+        and guild.me.guild_permissions.manage_threads
+        and guild.me.guild_permissions.manage_messages
+    )
 
 
 def preview_text(preview):
@@ -696,7 +1201,10 @@ def preview_text(preview):
             + ", ".join(preview["missing_permissions"])
             + " with the Discord permission link, then review again."
         )
-    if preview["read_gaps"]:
+    gaps = preview["read_gaps"]
+    if gaps and all(gap.get("access_granted") for gap in gaps):
+        message += "\nAccess was granted after this review, but the missed channels or private threads are not in this snapshot. Review again to inventory them."
+    elif gaps:
         message += "\nSome channel or private thread history is inaccessible. Complete access is needed for a full server cleanup."
     return message
 
@@ -707,34 +1215,106 @@ def preview_view(preview):
         view.add_item(
             CleanupButton(preview["guild_id"], preview["snapshot_id"], "confirm")
         )
-    for item in preview["permission_urls"][:3]:
+    # Permission links appear only while a real deficit exists on the capable
+    # bot (permission_urls is already empty once access is granted). Read gaps
+    # whose access was granted show the plain "Review again" action instead.
+    for item in (
+        preview["permission_urls"][:3] if preview["missing_permissions"] else []
+    ):
         view.add_item(
             discord.ui.Button(
                 label="Enable cleanup · " + item["name"][:45], url=item["url"]
             )
         )
-    view.add_item(CleanupButton(preview["guild_id"]))
+    review = CleanupButton(preview["guild_id"])
+    if preview["read_gaps"] and not preview["missing_permissions"]:
+        review.item.label = "Review again"
+    view.add_item(review)
     return view
 
 
 def status_view(client, runtime):
+    """Status card: one Review button, plus a permission link only when the
+    SHARED cleanup operation lacks a capable connected bot (never a redundant
+    per-identity grant when the other identity already holds the permissions)."""
     view = discord.ui.View(timeout=None)
     guild_id = int(client.config["guild_id"])
     view.add_item(CleanupButton(guild_id))
-    if client.user:
-        guild = client.get_guild(guild_id)
-        if guild and not guild.me.guild_permissions.manage_threads:
-            view.add_item(
-                discord.ui.Button(
-                    label="Enable cleanup permissions",
-                    url=permissions_url(client.user.id, guild_id),
-                )
+    manager = getattr(runtime, "cleanup", None)
+    capable = manager.capable_client(guild_id) if manager else client
+    if capable and capable.user and not permissions_granted(capable, guild_id):
+        view.add_item(
+            discord.ui.Button(
+                label="Enable cleanup permissions · " + capable.user.display_name[:30],
+                url=permissions_url(capable.user.id, guild_id),
             )
+        )
     return view
 
 
 def install_commands(client, runtime):
     client.add_dynamic_items(CleanupButton)
+
+    async def recover():
+        """Restart recovery: refresh/retire this bot's cards from persisted IDs
+        and surface a Retry card for runs that were interrupted mid-flight."""
+        guild_id = str(client.config["guild_id"])
+        manager = runtime.cleanup
+        await manager.refresh_permission_cards(guild_id)
+        # Drive recovery from persisted SNAPSHOT rows, not surviving cards: all
+        # source cards may have been retired right before the interruption.
+        for snapshot in manager.resumable(guild_id):
+            snapshot_id = snapshot["snapshot_id"]
+            rows = [
+                row
+                for row in manager._controls(guild_id)
+                if row.get("snapshot_id") == snapshot_id
+            ]
+            # An active Retry card for this snapshot (either bot) already exists.
+            if any(
+                row.get("state") == "active"
+                and (owner := manager._owner_client(row.get("owner_id"))) is not None
+                and owner.is_ready()
+                for row in rows
+            ):
+                continue
+            # Only one bot posts the Retry card: the one that owned the last
+            # card for this snapshot, else the first ready bot.
+            owners = [manager._owner_client(row.get("owner_id")) for row in rows]
+            ready_owners = [
+                owner for owner in owners if owner is not None and owner.is_ready()
+            ]
+            poster = (
+                ready_owners[-1] if ready_owners else manager.capable_client(guild_id)
+            )
+            if poster is None or str(poster.user.id) != str(client.user.id):
+                continue
+            channel_id = rows[-1]["channel_id"] if rows else snapshot.get("channel_id")
+            channel = client.get_channel(int(channel_id)) if channel_id else None
+            if channel is None and channel_id:
+                try:
+                    channel = await client.fetch_channel(int(channel_id))
+                except discord.HTTPException:
+                    continue
+            if channel is None:
+                continue
+            sent = await channel.send(
+                "Cleanup was interrupted by a restart. Retry resumes the same snapshot with saved progress.",
+                view=retry_view(client, runtime, guild_id, snapshot_id),
+            )
+            manager.track_control(sent, snapshot_id, guild_id=guild_id)
+
+    async def safe_recover():
+        try:
+            await recover()
+        except Exception:  # Recovery must never block the READY path.
+            pass
+
+    # HubTogether.on_ready / on_guild_role_update call these hooks here; the
+    # operator foundation dispatches the same callbacks for the Department bot.
+    # Both identities run recovery; each edits only cards it owns.
+    client.cleanup_recover = safe_recover
+    client.cleanup_permissions_changed = runtime.cleanup.refresh_permission_cards
 
     @app_commands.command(
         name="cleanup", description="Review clearing server messages and AI threads"
@@ -751,10 +1331,9 @@ def install_commands(client, runtime):
             return
         await interaction.response.defer(thinking=True)
         try:
+            # Supersession/retirement happen inside manager.preview (serialized).
             preview = await runtime.cleanup.preview(interaction.guild_id)
-            await interaction.followup.send(
-                content=preview_text(preview), view=preview_view(preview)
-            )
+            await publish_preview(interaction, runtime.cleanup, preview)
         except (ValueError, discord.HTTPException) as error:
             await interaction.followup.send(
                 str(error)

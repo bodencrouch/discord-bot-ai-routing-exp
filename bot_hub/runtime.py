@@ -26,11 +26,6 @@ class HubParent(Parent):
         super().__init__(config)
         self.tree = app_commands.CommandTree(self)
         self.changes.restart = restart_chat
-        # The maintenance agent must remain recoverable while editing its child.
-        original_editable = self.changes.editable
-        self.changes.editable = lambda name: (
-            not Path(name).parts[0] == "bot_hub" and original_editable(name)
-        )
         original_post = self.changes.http.post
 
         async def post(url, **kwargs):
@@ -145,7 +140,7 @@ class HubParent(Parent):
                 "tool.completed" if completed else "tool.started",
                 {"job_id": job_id, "name": message.split("**")[1], "message": message},
             )
-        await super().progress(job_id, message)
+        return await super().progress(job_id, message)
 
     def cleanup_running(self):
         runtime = getattr(self, "hub_runtime", None)
@@ -319,6 +314,27 @@ class Runtime:
 
         install_commands(client, self)
         tree = client.tree
+        if tree.get_command("modify") is None:
+
+            @tree.command(
+                name="modify",
+                description="Request a code change and review its proposal before applying",
+            )
+            @app_commands.describe(
+                request="The change you want to make to this application",
+                context="Optional background or Discord message links",
+                source="Optional screenshot or supporting attachment",
+            )
+            async def modify_command(
+                interaction: discord.Interaction,
+                request: str,
+                context: str = "",
+                source: discord.Attachment | None = None,
+            ):
+                await self.submit_modification(
+                    client, interaction, request, context=context, source=source
+                )
+
         if tree.get_command("projects") is None:
 
             @tree.command(
@@ -385,7 +401,231 @@ class Runtime:
             )
             tracker = getattr(self.cleanup, "track_control", None)
             if tracker:
-                tracker(await interaction.original_response())
+                tracker(
+                    await interaction.original_response(), guild_id=interaction.guild_id
+                )
+
+    async def ensure_maintenance(self, client):
+        """Give a chat identity its own maintenance worker and private job history."""
+        lock = getattr(client, "_maintenance_lock", None)
+        if lock is None:
+            lock = client._maintenance_lock = asyncio.Lock()
+        async with lock:
+            if self.closed or client.is_closed() or not client.is_ready():
+                raise RuntimeError(
+                    "The Discord identity must be connected for self-maintenance"
+                )
+            controller = getattr(client, "maintenance_controller", None)
+            if controller is None or controller._maintenance_closed:
+                from .maintenance import HostMaintenance
+
+                settings = dict(client.config)
+                settings.update(self.config.get("maintenance", {}))
+                settings.update(client.config.get("maintenance", {}))
+                settings.update(client.instance.get("maintenance", {}))
+                config_file = (
+                    client.instance.get("maintenance_config_file")
+                    or client.config.get("maintenance_config_file")
+                    or self.config.get("maintenance_config_file")
+                )
+                if config_file:
+                    settings.update(
+                        json.loads(Path(config_file).expanduser().read_text())
+                    )
+                else:
+                    for instance in self.instances():
+                        if instance.get("preset") != "maintenance":
+                            continue
+                        candidate = json.loads(self._config_path(instance).read_text())
+                        if str(candidate.get("guild_id")) == str(
+                            client.config["guild_id"]
+                        ):
+                            settings.update(candidate)
+                            break
+                    else:
+                        path = (
+                            Path(__file__).resolve().parents[1] / "parent.config.json"
+                        )
+                        if path.is_file():
+                            settings.update(json.loads(path.read_text()))
+                if not settings.get("energy_hook"):
+                    raise ValueError(
+                        "Self-maintenance requires the configured energy_hook"
+                    )
+                identity = hashlib.sha256(client.instance["id"].encode()).hexdigest()[
+                    :16
+                ]
+                database = (
+                    Path(settings.get("database") or self.config["database"])
+                    .expanduser()
+                    .resolve()
+                )
+                directory = database.parent / "maintenance" / identity
+                directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+                settings["database"] = str(directory / "jobs.sqlite")
+                settings["guild_id"] = int(client.config["guild_id"])
+                settings.setdefault("target", str(Path(__file__).resolve().parents[1]))
+                settings.setdefault(
+                    "model", PRESETS["maintenance"]["defaults"]["model"]
+                )
+                settings.setdefault("planning_fallback_model", "auto/fast")
+                settings.setdefault("channel_id", 0)
+                controller = HostMaintenance(client, settings, self)
+                client.maintenance_controller = controller
+            await controller.start()
+            return controller
+
+    async def submit_modification(
+        self, client, interaction, request, *, context="", source=None
+    ):
+        """File a real source post under the identity that received /modify."""
+        if not interaction.guild or str(interaction.guild.id) != str(
+            client.config["guild_id"]
+        ):
+            await interaction.response.send_message(
+                "Use this command in the configured server.", ephemeral=True
+            )
+            return
+        if self.closed or self.cleanup.is_running(str(interaction.guild.id)):
+            await interaction.response.send_message(
+                "Server maintenance is in progress. Try again when it finishes.",
+                ephemeral=True,
+            )
+            return
+        if not client.allowed(interaction.channel):
+            await interaction.response.send_message(
+                "This instance is scoped to its configured channels.", ephemeral=True
+            )
+            return
+        prompt = request.strip()
+        if not prompt:
+            await interaction.response.send_message(
+                "Describe the change you want to make.", ephemeral=True
+            )
+            return
+        if context.strip():
+            prompt += "\n\nContext\n" + context.strip()
+        await interaction.response.defer(thinking=True)
+        planners = [
+            candidate
+            for candidate in self.clients.values()
+            if isinstance(candidate, HubParent)
+            and candidate.is_ready()
+            and str(candidate.config["guild_id"]) == str(interaction.guild.id)
+        ]
+        planner = client if client in planners else None
+        if hasattr(client, "engine"):
+            try:
+                planner = await self.ensure_maintenance(client)
+            except Exception as error:
+                logging.exception("Could not initialize self-maintenance")
+                self.state.record(
+                    client.instance["id"],
+                    "maintenance.request_failed",
+                    {"error": type(error).__name__},
+                )
+                await interaction.followup.send(
+                    "Self-maintenance could not start. Check the configured maintenance settings.",
+                    ephemeral=True,
+                )
+                return
+        if planner is None:
+            planner = next(iter(planners), None)
+        if planner is None:
+            await interaction.followup.send(
+                "The maintenance planner is offline. Try again after it reconnects.",
+                ephemeral=True,
+            )
+            return
+        content = f"<@{planner.user.id}> {prompt}"
+        if len(content) > 2000:
+            await interaction.followup.send(
+                "The request and context exceed Discord’s 2,000-character message limit. "
+                "Shorten the text or link a source message.",
+                ephemeral=True,
+            )
+            return
+        message = None
+        try:
+            if planner is getattr(client, "maintenance_controller", None):
+                channel = interaction.channel
+                if isinstance(channel, discord.Thread) and not planner.owns_thread(
+                    channel.id
+                ):
+                    private = channel.is_private()
+                    channel = (
+                        channel.parent
+                        or client.get_channel(channel.parent_id)
+                        or await client.fetch_channel(channel.parent_id)
+                    )
+                    if private:
+                        channel = await channel.create_thread(
+                            name=f"Code change · {request.strip()[:70]}",
+                            type=discord.ChannelType.private_thread,
+                            invitable=False,
+                            auto_archive_duration=1440,
+                        )
+                        await channel.add_user(interaction.user)
+            else:
+                channel_id = int(planner.config["channel_id"])
+                channel = client.get_channel(channel_id) or await client.fetch_channel(
+                    channel_id
+                )
+            if not planner.allowed(channel):
+                raise ValueError("The maintenance source channel is outside its scope")
+            files = [await source.to_file()] if source else []
+            try:
+                if isinstance(channel, discord.ForumChannel):
+                    created = await channel.create_thread(
+                        name=f"Code change · {request.strip()[:70]}",
+                        content=content,
+                        files=files,
+                        allowed_mentions=discord.AllowedMentions.none(),
+                        auto_archive_duration=1440,
+                    )
+                    message = created.message
+                else:
+                    message = await channel.send(
+                        content,
+                        files=files,
+                        allowed_mentions=discord.AllowedMentions.none(),
+                    )
+            finally:
+                for file in files:
+                    file.close()
+            job = await planner.submit_request(message, prompt, author=interaction.user)
+            self.state.record(
+                client.instance["id"],
+                "maintenance.request",
+                {
+                    "job_id": job["id"],
+                    "planner_id": planner.instance["id"],
+                    "user_id": str(interaction.user.id),
+                    "channel_id": str(interaction.channel_id),
+                    "source_id": str(message.id),
+                    "request": prompt,
+                },
+            )
+            await interaction.followup.send(
+                f"<@{client.user.id}> opened **Skill Issue #{job['id']}** "
+                f"with <@{planner.user.id}> for <@{interaction.user.id}> "
+                f"in <#{job['thread']}>. Review the proposal there and approve it to apply.",
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+        except Exception as error:
+            logging.exception("Could not submit /modify request")
+            self.state.record(
+                client.instance["id"],
+                "maintenance.request_failed",
+                {"error": type(error).__name__},
+            )
+            detail = f" Your source post is at {message.jump_url}." if message else ""
+            await interaction.followup.send(
+                "The maintenance request could not be opened."
+                + detail
+                + " Try again after checking the maintenance connection and channel permissions.",
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
 
     def project_channel_allowed(self, client, channel):
         if not channel or not getattr(channel, "guild", None):
@@ -849,12 +1089,54 @@ class Runtime:
             name=f"bot-hub-component:{instance_id}",
         )
 
+    async def _wait_for_ready(self, instance_id, timeout=90):
+        """Follow the supervised client without relying on Discord's pre-login event."""
+        instance_id = str(instance_id)
+        try:
+            async with asyncio.timeout(timeout):
+                while True:
+                    if self.closed:
+                        raise RuntimeError("The bot runtime is closing")
+                    client = self.clients.get(instance_id)
+                    supervisor = self.tasks.get(instance_id)
+                    if supervisor is None:
+                        if self.registry_lock.locked():
+                            # apply temporarily removes the previous supervisor while closing it.
+                            await asyncio.sleep(0.25)
+                            continue
+                        raise RuntimeError(
+                            f"Discord instance {instance_id} has no running supervisor"
+                        )
+                    if supervisor.cancelled():
+                        raise RuntimeError(
+                            f"Discord instance {instance_id} supervisor was cancelled"
+                        )
+                    if supervisor.done():
+                        error = supervisor.exception()
+                        reason = self.errors.get(instance_id) or (
+                            type(error).__name__ if error else "ConnectionClosed"
+                        )
+                        raise RuntimeError(
+                            f"Discord instance {instance_id} supervisor stopped ({reason})"
+                        )
+                    if self.errors.get(instance_id) in {
+                        "LoginFailure",
+                        "PrivilegedIntentsRequired",
+                    }:
+                        raise RuntimeError(
+                            f"Discord instance {instance_id} cannot connect ({self.errors[instance_id]})"
+                        )
+                    if client is not None and client.is_ready():
+                        return client
+                    await asyncio.sleep(0.25)
+        except TimeoutError as error:
+            raise RuntimeError(
+                f"Discord instance {instance_id} did not become ready within {timeout} seconds"
+            ) from error
+
     async def _attach_component(self, instance_id, host_id, component):
         try:
-            host = self.clients.get(host_id)
-            if host is None:
-                return
-            await host.wait_until_ready()
+            host = await self._wait_for_ready(host_id)
             if (
                 self.clients.get(instance_id) is not component
                 or self.clients.get(host_id) is not host
@@ -967,12 +1249,11 @@ class Runtime:
         for instance in instances:
             await self.apply(instance["id"])
         for instance in instances:
-            client = self.clients.get(instance["id"])
-            if client is None:
-                raise RuntimeError("Chat instance could not restart")
-            await asyncio.wait_for(client.wait_until_ready(), timeout=90)
-            if not client.is_ready():
-                raise RuntimeError("Chat instance did not reconnect")
+            await self._wait_for_ready(instance["id"])
+        for client in self.clients.values():
+            recover = getattr(client, "cleanup_recover", None)
+            if recover and client.is_ready():
+                await recover()
 
     async def _command(self, *args):
         process = await asyncio.create_subprocess_exec(

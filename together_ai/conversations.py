@@ -51,6 +51,12 @@ class TurnButton(
                 "This conversation turn is no longer available."
             )
             return
+        if turn["version"] != self.version:
+            await interaction.response.send_message(
+                "That answer has already changed. Use its current controls.",
+                ephemeral=True,
+            )
+            return
         if self.action == "edit":
             if str(interaction.user.id) != turn["author_id"]:
                 await interaction.response.send_message(

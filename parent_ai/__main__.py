@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import fcntl
 import io
 import json
 import logging
@@ -7,6 +8,7 @@ import mimetypes
 import os
 import re
 import sqlite3
+from datetime import datetime, timezone
 from pathlib import Path
 
 import discord
@@ -44,6 +46,7 @@ def progress_icon(message):
             "🚀",
             (
                 "source matches",
+                "deployment",
                 "files applied",
                 "applying",
                 "restarting",
@@ -78,9 +81,11 @@ class EditRequest(discord.ui.Modal, title="Refine the skill issue"):
 
     async def on_submit(self, interaction):
         await interaction.response.defer()
-        await interaction.client.revise(
-            interaction, self.job_id, self.version, self.request.value
+        bot = (
+            getattr(interaction.client, "maintenance_controller", None)
+            or interaction.client
         )
+        await bot.revise(interaction, self.job_id, self.version, self.request.value)
 
 
 class RequestButton(
@@ -110,7 +115,10 @@ class RequestButton(
         return cls(int(match["job"]), int(match["version"]), match["action"])
 
     async def callback(self, interaction):
-        bot = interaction.client
+        bot = (
+            getattr(interaction.client, "maintenance_controller", None)
+            or interaction.client
+        )
         job = bot.get(self.job)
         if (
             not bot.allowed(interaction.channel)
@@ -119,6 +127,12 @@ class RequestButton(
         ):
             await interaction.response.send_message(
                 "The requester or a server administrator can manage this change."
+            )
+            return
+        if not job["thread"] and self.action in {"approve", "edit", "retry"}:
+            await interaction.response.send_message(
+                "This request has no usable thread. Submit it again using /modify.",
+                ephemeral=True,
             )
             return
         busy = getattr(bot, "cleanup_running", None)
@@ -163,7 +177,7 @@ class RequestButton(
                     self.job,
                     state="queued",
                     version=expected_version,
-                    note="The child changed. Preparing a fresh preview for approval.",
+                    note="The application changed. Preparing a fresh preview for approval.",
                 )
             else:
                 bot.update(
@@ -269,6 +283,10 @@ class Parent(discord.Client):
             row[1] for row in self.db.execute("PRAGMA table_info(jobs)")
         }:
             self.db.execute("ALTER TABLE jobs ADD COLUMN failure_message TEXT")
+        if "source_channel" not in {
+            row[1] for row in self.db.execute("PRAGMA table_info(jobs)")
+        }:
+            self.db.execute("ALTER TABLE jobs ADD COLUMN source_channel INTEGER")
         self.db.execute(
             "CREATE TABLE IF NOT EXISTS audit (id INTEGER PRIMARY KEY AUTOINCREMENT, job INTEGER, snapshot TEXT, recorded_at TEXT DEFAULT CURRENT_TIMESTAMP)"
         )
@@ -277,6 +295,7 @@ class Parent(discord.Client):
         self.activity_messages = {}
         self.wake = asyncio.Event()
         self.worker = None
+        self.deployment_monitor = None
         self.active_jobs = {}
         self.deploy_lock = asyncio.Lock()
         self.deploy_blocked = False
@@ -330,6 +349,8 @@ class Parent(discord.Client):
 
     async def setup_hook(self):
         self.worker = asyncio.create_task(self.work())
+        if self.self_deployment_enabled():
+            self.deployment_monitor = asyncio.create_task(self.monitor_deployments())
 
     async def on_ready(self):
         logging.info(
@@ -423,6 +444,9 @@ class Parent(discord.Client):
             await self.run_cleanup_hook("cleanup_permissions_changed", after.guild.id)
 
     async def close(self):
+        if self.deployment_monitor:
+            self.deployment_monitor.cancel()
+            await asyncio.gather(self.deployment_monitor, return_exceptions=True)
         if self.worker:
             self.worker.cancel()
             try:
@@ -467,18 +491,18 @@ class Parent(discord.Client):
             self.activity_messages[job_id] = str(sent.id)
             if view is not None:
                 self.update(job_id, failure_message=str(sent.id))
+            return sent
         except discord.HTTPException:
             logging.exception("Could not post request activity")
 
     async def card(self, job_id, attach=False):
         job = self.get(job_id)
-        channel = self.get_channel(
-            self.config["channel_id"]
-        ) or await self.fetch_channel(self.config["channel_id"])
+        channel_id = job["source_channel"] or self.config["channel_id"]
+        channel = self.get_channel(channel_id) or await self.fetch_channel(channel_id)
         view = discord.ui.View(timeout=None)
         if job["state"] == "awaiting":
             view.add_item(RequestButton(job_id, job["version"], "approve"))
-        if job["state"] != "applying":
+        if job["state"] != "applying" and job["thread"]:
             view.add_item(RequestButton(job_id, job["version"], "edit"))
         if job["state"] in {
             "queued",
@@ -489,7 +513,7 @@ class Parent(discord.Client):
             "failed",
         }:
             view.add_item(RequestButton(job_id, job["version"], "cancel"))
-        if job["state"] == "failed":
+        if job["state"] == "failed" and job["thread"]:
             view.add_item(RequestButton(job_id, job["version"], "retry"))
         embed = discord.Embed(
             title=f"🛠️ Skill Issue #{job_id} · {job['state']}",
@@ -507,13 +531,32 @@ class Parent(discord.Client):
                 value=f"<#{job['thread']}> · @mention me there with follow-ups.",
                 inline=False,
             )
-        embed.set_footer(
-            text=f"Revision {job['version']} · requester or administrator approval required"
+        footer = {
+            "awaiting": "requester or administrator approval required",
+            "approved": "approved",
+            "applying": "deploying approved changes",
+            "done": "deployed",
+            "failed": "retry available",
+            "clarify": "clarification needed",
+            "cancelled": "cancelled",
+        }.get(job["state"], "preparing proposal")
+        embed.set_footer(text=f"Revision {job['version']} · {footer}")
+        same_destination = bool(job["thread"] and int(channel_id) == int(job["thread"]))
+        if same_destination and not job["thread_card"] and job["card"]:
+            self.update(job_id, thread_card=job["card"])
+            job = self.get(job_id)
+        destinations = (
+            (("thread_card", channel),)
+            if same_destination
+            else (
+                ("card", channel),
+                (
+                    "thread_card",
+                    self.get_channel(job["thread"]) if job["thread"] else None,
+                ),
+            )
         )
-        for field, destination in (
-            ("card", channel),
-            ("thread_card", self.get_channel(job["thread"]) if job["thread"] else None),
-        ):
+        for field, destination in destinations:
             if field == "thread_card" and destination is None and job["thread"]:
                 destination = await self.fetch_channel(job["thread"])
             if not destination:
@@ -557,7 +600,12 @@ class Parent(discord.Client):
             params.pop("attachments", None)
             msg = await destination.send(**params, files=files)
             self.sessions.record_output(job_id, msg.id, destination.id, field)
-            self.update(job_id, **{field: msg.id})
+            fields = (
+                {"card": msg.id, "thread_card": msg.id}
+                if same_destination
+                else {field: msg.id}
+            )
+            self.update(job_id, **fields)
 
     async def revise(self, interaction, job_id, version, text):
         job = self.get(job_id)
@@ -566,6 +614,12 @@ class Parent(discord.Client):
             or not job
             or not self.can_manage(interaction.user, job)
         ):
+            return
+        if not job["thread"]:
+            await interaction.followup.send(
+                "This request has no usable thread. Submit it again using /modify.",
+                ephemeral=True,
+            )
             return
         if job["version"] != version or job["state"] == "applying":
             await interaction.followup.send(
@@ -593,14 +647,21 @@ class Parent(discord.Client):
         prompt = re.sub(rf"<@!?{self.user.id}>", "", message.content).strip()
         if not prompt:
             await message.reply(
-                "🛠️ @mention me with a change for Together AI. I’ll draft it, show the diff, and ask you to confirm. The department runs on consent and questionable coffee."
+                "🛠️ @mention me with a change for this bot or any configured bot. I’ll draft it, show the diff, and ask you to confirm. The department runs on consent and questionable coffee."
             )
             return
+        await self.submit_request(message, prompt)
+
+    async def submit_request(self, message, prompt, author=None):
+        """File a real Discord source on behalf of its requesting member."""
+        author = author or message.author
+        if not self.allowed(message.channel):
+            raise ValueError("Choose a configured maintenance channel.")
         job = self.db.execute(
             "SELECT * FROM jobs WHERE thread=? ORDER BY id DESC LIMIT 1",
             (message.channel.id,),
         ).fetchone()
-        if job and self.can_manage(message.author, job) and job["state"] != "applying":
+        if job and self.can_manage(author, job) and job["state"] != "applying":
             self.update(
                 job["id"],
                 request=job["request"] + "\n\nFollow-up\n" + prompt,
@@ -613,32 +674,64 @@ class Parent(discord.Client):
         else:
             with self.db:
                 cur = self.db.execute(
-                    "INSERT OR IGNORE INTO jobs(source,author,request,state) VALUES(?,?,?,?)",
-                    (str(message.id), message.author.id, prompt, "queued"),
+                    "INSERT OR IGNORE INTO jobs(source,author,request,state,source_channel) VALUES(?,?,?,?,?)",
+                    (str(message.id), author.id, prompt, "opening", message.channel.id),
                 )
             if not cur.rowcount:
-                return
+                return self.db.execute(
+                    "SELECT * FROM jobs WHERE source=?", (str(message.id),)
+                ).fetchone()
             job_id = cur.lastrowid
-            if isinstance(message.channel, discord.Thread):
-                thread = message.channel
-            else:
-                thread = await message.create_thread(
-                    name=f"Skill Issue #{job_id} · {prompt[:65]}",
-                    auto_archive_duration=1440,
-                )
-                await thread.add_user(message.author)
-            self.update(job_id, thread=thread.id)
+            thread = None
+            try:
+                if isinstance(message.channel, discord.Thread):
+                    thread = message.channel
+                else:
+                    thread = await message.create_thread(
+                        name=f"Skill Issue #{job_id} · {prompt[:65]}",
+                        auto_archive_duration=1440,
+                    )
+                    await thread.add_user(author)
+            except Exception:
+                current = self.get(job_id)
+                if current and current["state"] == "opening":
+                    self.update(
+                        job_id,
+                        state="failed",
+                        thread=thread.id if thread else None,
+                        note="Discord could not finish opening the request thread. Submit the request again using /modify.",
+                    )
+                raise
+            with self.db:
+                opened = self.db.execute(
+                    "UPDATE jobs SET thread=?,state='queued' WHERE id=? AND state='opening'",
+                    (thread.id, job_id),
+                ).rowcount
+            if not opened:
+                return self.get(job_id)
             await self.card(job_id)
             await message.reply(
                 f"Filed as **Skill Issue #{job_id}**. Follow-ups go in <#{thread.id}>. I’ll ask before applying anything."
             )
         self.wake.set()
+        return self.db.execute(
+            "SELECT * FROM jobs WHERE thread=? ORDER BY id DESC LIMIT 1",
+            (
+                message.channel.id
+                if isinstance(message.channel, discord.Thread)
+                else thread.id,
+            ),
+        ).fetchone()
 
     async def on_raw_message_edit(self, payload):
         job = self.db.execute(
             "SELECT * FROM jobs WHERE source=?", (str(payload.message_id),)
         ).fetchone()
-        if not job or job["state"] == "applying" or "content" not in payload.data:
+        if (
+            not job
+            or job["state"] in {"applying", "opening"}
+            or "content" not in payload.data
+        ):
             return
         channel = self.get_channel(payload.channel_id) or await self.fetch_channel(
             payload.channel_id
@@ -681,12 +774,165 @@ class Parent(discord.Client):
             )
             await self.card(job["id"])
 
-    async def work(self):
+    def self_deployment_enabled(self):
+        return bool(self.config.get("hub_config") or os.environ.get("BOT_HUB_CONFIG"))
+
+    async def resume_deployment_handoffs(self):
+        """Recover approved ownership without restoring files in the hub process."""
+        from . import self_deploy
+
+        for job in self.db.execute(
+            "SELECT * FROM jobs WHERE state='applying'"
+        ).fetchall():
+            if self_deploy.status(self.config, job["id"], job["version"]):
+                continue
+            try:
+                await self_deploy.launch(
+                    self.config, job["id"], job["version"], json.loads(job["proposal"])
+                )
+            except (OSError, ValueError, RuntimeError) as error:
+                logging.warning(
+                    "Deployment handoff for job %s will retry (%s)",
+                    job["id"],
+                    type(error).__name__,
+                )
+        return await self_deploy.recover(self.config)
+
+    async def notify_deployment(self, job, transaction):
+        """Reconcile a stable Discord receipt before retrying uncertain delivery."""
+        from . import self_deploy
+
+        version = transaction["version"]
+        with self_deploy.notification_lock(self.config, job["id"], version) as lock:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return False
+            if self_deploy.status(self.config, job["id"], version).get("notified"):
+                return True
+            delivery = self_deploy.notification(self.config, job["id"], version)
+            thread = self.get_channel(job["thread"]) or await self.fetch_channel(
+                job["thread"]
+            )
+            if thread.archived:
+                await thread.edit(archived=False)
+            transport = getattr(self, "host", self)
+            owned_id = transport.user.id
+            sent = None
+            if delivery.get("message_id"):
+                try:
+                    sent = await thread.fetch_message(int(delivery["message_id"]))
+                except discord.NotFound:
+                    pass
+            if sent is None:
+                since = datetime.fromtimestamp(
+                    max(0, transaction.get("created_at", 0) - 5), timezone.utc
+                )
+                async for candidate in thread.history(limit=None, after=since):
+                    if (
+                        candidate.author.id == owned_id
+                        and delivery["marker"] in candidate.content
+                    ):
+                        sent = candidate
+                        break
+            if sent is None:
+                message = transaction.get("note") or "Deployment finished."
+                content = f"{progress_icon(message)} {message}\n{delivery['marker']}"
+                # Discord's nonce enforcement covers an uncertain send response,
+                # while history reconciliation covers recovery after its nonce window.
+                data = await transport.http.request(
+                    discord.http.Route(
+                        "POST", "/channels/{channel_id}/messages", channel_id=thread.id
+                    ),
+                    json={
+                        "content": content,
+                        "nonce": delivery["nonce"],
+                        "enforce_nonce": True,
+                        "allowed_mentions": {"parse": []},
+                    },
+                )
+                sent = discord.Message(state=thread._state, channel=thread, data=data)
+            delivery.update(message_id=str(sent.id), channel_id=str(thread.id))
+            self_deploy.save_notification(self.config, job["id"], version, delivery)
+            self.sessions.record_output(job["id"], sent.id, thread.id, "progress")
+            self.activity_messages[job["id"]] = str(sent.id)
+            self_deploy.mark_notified(self.config, job["id"], version)
+            return True
+
+    async def monitor_deployments(self):
+        """Retry durable handoffs and reconcile every transaction revision."""
+        from . import self_deploy
+
         await self.wait_until_ready()
+        while not self.is_closed():
+            try:
+                await self.resume_deployment_handoffs()
+                for transaction in self_deploy.list_transactions(self.config):
+                    if not transaction or not transaction.get("terminal"):
+                        continue
+                    if transaction["phase"] == "blocked":
+                        self.deploy_blocked = True
+                    if transaction["phase"] == "stale":
+                        self.wake.set()
+                    if transaction.get("notified"):
+                        continue
+                    job = self.get(transaction["job_id"])
+                    if not job or not job["thread"]:
+                        continue
+                    # Existing cards are edited in place. Completion has its own
+                    # durable identity and can recover a send whose reply was lost.
+                    try:
+                        await self.card(job["id"])
+                        if await self.notify_deployment(job, transaction):
+                            self.wake.set()
+                    except Exception:
+                        logging.exception(
+                            "Could not deliver deployment outcome for job %s", job["id"]
+                        )
+                        continue
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logging.exception("Could not reconcile self-deployment outcome")
+            await asyncio.sleep(3)
+
+    async def work(self):
+        interrupted_openings = self.db.execute(
+            "SELECT id,version FROM jobs WHERE state='opening'"
+        ).fetchall()
+        await self.wait_until_ready()
+        for opening in interrupted_openings:
+            current = self.get(opening["id"])
+            if (
+                current
+                and current["state"] == "opening"
+                and current["version"] == opening["version"]
+            ):
+                self.update(
+                    opening["id"],
+                    state="failed",
+                    note="Request thread setup was interrupted. Submit the request again using /modify.",
+                )
+                try:
+                    await self.card(opening["id"])
+                except discord.HTTPException:
+                    logging.exception(
+                        "Could not report interrupted request thread setup"
+                    )
+        if self.self_deployment_enabled():
+            recovered = await self.resume_deployment_handoffs()
+            self.deploy_blocked = any(
+                transaction and transaction.get("phase") == "blocked"
+                for transaction in recovered
+            )
         # Interrupted writes have a durable pre-change snapshot. Restore before accepting more work.
         for job in self.db.execute(
             "SELECT * FROM jobs WHERE state='applying'"
         ).fetchall():
+            if self.self_deployment_enabled():
+                # The monitor re-hands off missing manifests. All self-deployment
+                # source restoration belongs to the independent locked watchdog.
+                continue
             try:
                 self.changes.restore(json.loads(job["proposal"]))
                 await self.changes.restart()
@@ -708,7 +954,7 @@ class Parent(discord.Client):
         while not self.is_closed():
             self.wake.clear()
             for job in self.db.execute(
-                "SELECT * FROM jobs WHERE state IN ('approved','queued') ORDER BY id"
+                "SELECT * FROM jobs WHERE state IN ('approved','queued') AND thread IS NOT NULL ORDER BY id"
             ).fetchall():
                 if job["id"] not in self.active_jobs and not (
                     self.deploy_blocked and job["state"] == "approved"
@@ -718,7 +964,10 @@ class Parent(discord.Client):
                     task.add_done_callback(
                         lambda _, job_id=job["id"]: self.job_finished(job_id)
                     )
-            await self.wake.wait()
+            try:
+                await asyncio.wait_for(self.wake.wait(), timeout=3)
+            except asyncio.TimeoutError:
+                pass
 
     def job_finished(self, job_id):
         self.active_jobs.pop(job_id, None)
@@ -730,6 +979,11 @@ class Parent(discord.Client):
             job["thread"]
         )
         parent = getattr(thread, "parent", None) or thread
+        source_channel = job["source_channel"]
+        if source_channel:
+            parent = self.get_channel(source_channel) or await self.fetch_channel(
+                source_channel
+            )
         messages = {}
         errors = []
         try:
@@ -948,7 +1202,17 @@ class Parent(discord.Client):
             await self.card(job_id, attach=True)
         except Exception as exc:
             logging.exception("Request failed")
-            if self.get(job_id)["version"] == version:
+            current = self.get(job_id)
+            if (
+                self.self_deployment_enabled()
+                and current["version"] == version
+                and current["state"] == "applying"
+            ):
+                # Once approved ownership commits, transport and handoff failures
+                # are recovered by the deployment monitor independently of planning.
+                self.wake.set()
+                return
+            if current["version"] == version:
                 self.update(
                     job_id,
                     state="failed",
@@ -970,7 +1234,7 @@ class Parent(discord.Client):
                 job_id,
                 state="queued",
                 version=version + 1,
-                note="Child changed. Preparing a fresh approval preview.",
+                note="Application source changed. Preparing a fresh approval preview.",
             )
             await self.card(job_id)
             return
@@ -984,6 +1248,25 @@ class Parent(discord.Client):
             job_id,
             "Source matches the approved preview. Applying the reviewed files and settings.",
         )
+        if self.self_deployment_enabled():
+            from . import self_deploy
+
+            await self.progress(
+                job_id,
+                "Deployment watchdog is taking over. It will restart the unified bot application, verify every enabled identity, and restore the approved baseline if reconnecting fails.",
+            )
+            try:
+                await self_deploy.launch(self.config, job_id, version, proposal)
+            except (OSError, ValueError, RuntimeError) as error:
+                # Keep approved ownership so the monitor can retry this handoff.
+                logging.warning(
+                    "Deployment watchdog launch will retry (%s)", type(error).__name__
+                )
+                self.update(
+                    job_id,
+                    note="Approved deployment is waiting for its independent watchdog. Launch will retry automatically.",
+                )
+            return
         try:
             self.changes.install(proposal)
             await self.progress(

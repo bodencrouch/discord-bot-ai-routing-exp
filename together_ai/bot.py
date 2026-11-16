@@ -8,6 +8,7 @@ import os
 import re
 import time
 import uuid
+from collections import OrderedDict
 from pathlib import Path
 
 import discord
@@ -18,7 +19,7 @@ from .core import Engine, Store
 from .routing import routing_report
 
 HELP = """**Together AI**
-Mention me to chat, or use `/chat`. Replies share context within the current channel or thread.
+In public channels, mention me or use `/chat`. In managed AI conversation threads, chat normally without mentions. Replies share context within the current channel or thread.
 `/thread with_user` starts a shared conversation and invites your friends. Everyone can chat there without mentioning me.
 Use **Retry** or **Edit prompt** beneath an answer. Editing your original Discord message also regenerates it.
 Editing an earlier thread prompt rewinds the thread, removes later messages, and regenerates from there.
@@ -37,6 +38,62 @@ Messages sent to me and requested summaries go to the configured AI gateway. Ans
 def load_config():
     path = Path(os.environ.get("TOGETHER_CONFIG", "config.json"))
     return path, json.loads(path.read_text())
+
+
+def has_image_attachment(message):
+    extensions = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
+    return any(
+        (attachment.content_type or "").startswith("image/")
+        or Path(attachment.filename).suffix.lower() in extensions
+        for attachment in message.attachments
+    )
+
+
+async def attachment_image_parts(message, budget):
+    """Read image bytes from Discord attachments within a shared request budget."""
+    parts = []
+    for attachment in message.attachments:
+        mime_hint = attachment.content_type or ""
+        if not mime_hint.startswith("image/") and Path(
+            attachment.filename
+        ).suffix.lower() not in {".png", ".jpg", ".jpeg", ".gif", ".webp"}:
+            continue
+        if attachment.size > 8 * 1024 * 1024 or attachment.size > budget["bytes"]:
+            raise ValueError(
+                "Each image must fit 8 MiB, with at most 16 MiB of images per request."
+            )
+        try:
+            data = await attachment.read()
+        except discord.HTTPException:
+            raise ValueError(
+                "Discord could not load an attached image. Reattach it and retry."
+            ) from None
+        if len(data) > 8 * 1024 * 1024 or len(data) > budget["bytes"]:
+            raise ValueError(
+                "Each image must fit 8 MiB, with at most 16 MiB of images per request."
+            )
+        if data.startswith(b"\x89PNG\r\n\x1a\n"):
+            mime = "image/png"
+        elif data.startswith(b"\xff\xd8\xff"):
+            mime = "image/jpeg"
+        elif data.startswith((b"GIF87a", b"GIF89a")):
+            mime = "image/gif"
+        elif data.startswith(b"RIFF") and data[8:12] == b"WEBP":
+            mime = "image/webp"
+        else:
+            raise ValueError(
+                "Image attachments must contain PNG, JPEG, GIF or WebP bytes."
+            )
+        budget["bytes"] -= len(data)
+        parts.append(
+            {
+                "type": "image_url",
+                "image_url": {
+                    "url": "data:" + mime + ";base64," + base64.b64encode(data).decode()
+                },
+            }
+        )
+    return parts
 
 
 class RawJSONButton(
@@ -112,6 +169,8 @@ class Together(discord.Client):
         self.ambient_tasks = {}
         self.ambient_sequences = {}
         self.last_ambient_reply = {}
+        self.image_cache = OrderedDict()
+        self.image_cache_bytes = 0
         self.add_dynamic_items(RawJSONButton, TurnButton)
         self.register_commands()
 
@@ -207,6 +266,105 @@ class Together(discord.Client):
             return await existing.edit(content=content, attachments=files, view=view)
         return await send(content=content, files=files, view=view)
 
+    def invalidate_image_cache(self, message_id):
+        cached = self.image_cache.pop(str(message_id), None)
+        if cached is not None:
+            self.image_cache_bytes -= cached["bytes"]
+
+    def dispatch(self, event, *args, **kwargs):
+        # Invalidate before subclass raw handlers can return for scope/dry-run checks.
+        if args and event in {
+            "raw_message_edit",
+            "raw_message_delete",
+            "raw_bulk_message_delete",
+        }:
+            payload = args[0]
+            message_ids = (
+                payload.message_ids
+                if event == "raw_bulk_message_delete"
+                else [payload.message_id]
+            )
+            for message_id in message_ids:
+                self.invalidate_image_cache(message_id)
+        super().dispatch(event, *args, **kwargs)
+
+    async def source_image_parts(
+        self, channel, source_id, budget, source=None, refresh=False
+    ):
+        """Cache source images/negative lookups, while keeping inference bytes bounded."""
+        key = str(source_id)
+        if refresh:
+            self.invalidate_image_cache(key)
+        cached = self.image_cache.get(key)
+        if cached is None:
+            source = source or await channel.fetch_message(int(source_id))
+            source_budget = {"bytes": 16 * 1024 * 1024}
+            parts = await attachment_image_parts(source, source_budget)
+            cached = {
+                "parts": parts,
+                "bytes": 16 * 1024 * 1024 - source_budget["bytes"],
+            }
+            self.image_cache[key] = cached
+            self.image_cache_bytes += cached["bytes"]
+            while (
+                len(self.image_cache) > 256 or self.image_cache_bytes > 64 * 1024 * 1024
+            ):
+                _, expired = self.image_cache.popitem(last=False)
+                self.image_cache_bytes -= expired["bytes"]
+        else:
+            self.image_cache.move_to_end(key)
+        if cached["bytes"] > budget["bytes"]:
+            raise ValueError(
+                "At most 16 MiB of image bytes fit this request. Earlier image input was omitted."
+            )
+        budget["bytes"] -= cached["bytes"]
+        return cached["parts"]
+
+    async def image_history(self, channel, history, budget):
+        """Reload recent source images without persisting image bytes in SQLite."""
+        context = []
+        candidates = []
+        for message in history:
+            entry = dict(message)
+            source_id = entry.pop("source_id", None)
+            context.append(entry)
+            if source_id and entry.get("role") == "user":
+                candidates.append((entry, source_id))
+        for entry, source_id in reversed(candidates):
+            try:
+                parts = await self.source_image_parts(channel, source_id, budget)
+            except (
+                discord.HTTPException,
+                ValueError,
+                OSError,
+                asyncio.TimeoutError,
+            ) as error:
+                content = entry.get("content", "")
+                detail = (
+                    ("Discord HTTP " + str(error.status))
+                    if isinstance(error, discord.HTTPException)
+                    else str(error)
+                )
+                note = {
+                    "type": "text",
+                    "text": "Earlier image input unavailable: "
+                    + (detail or type(error).__name__),
+                }
+                entry["content"] = (
+                    [{"type": "text", "text": content}]
+                    if isinstance(content, str)
+                    else list(content)
+                ) + [note]
+                continue
+            if parts:
+                content = entry.get("content", "")
+                entry["content"] = (
+                    [{"type": "text", "text": content}]
+                    if isinstance(content, str)
+                    else list(content)
+                ) + parts
+        return context
+
     async def run_turn(
         self,
         channel,
@@ -225,13 +383,14 @@ class Together(discord.Client):
             existing_turn = self.store.turn_by_source(source_id) if source_id else None
             if existing_turn and existing_turn["room"] == room:
                 return existing_turn
+            source = None
             if source_id:
                 try:
-                    await channel.fetch_message(int(source_id))
+                    source = await channel.fetch_message(int(source_id))
                 except discord.NotFound:
                     return None
             context = (
-                self.store.history(room, exclude_source=source_id)
+                self.store.history(room, exclude_source=source_id, with_sources=True)
                 if history is None
                 else history
             )
@@ -254,6 +413,15 @@ class Together(discord.Client):
             )
             try:
                 async with self.slots, channel.typing():
+                    budget = {"bytes": 16 * 1024 * 1024}
+                    images = (
+                        await self.source_image_parts(
+                            channel, source.id, budget, source=source, refresh=True
+                        )
+                        if source
+                        else []
+                    )
+                    context = await self.image_history(channel, context, budget)
                     selected, answer, raw = await self.engine.ask(
                         room,
                         prompt,
@@ -261,6 +429,7 @@ class Together(discord.Client):
                         selected,
                         skill,
                         history=context,
+                        images=images,
                         persist=False,
                         casual=not isinstance(channel, discord.Thread),
                         ambient=ambient,
@@ -332,7 +501,7 @@ class Together(discord.Client):
         self.store.set_model(str(thread.id), selected)
         mentions = " ".join(member.mention for member in people.values())
         await thread.send(
-            f"{mentions}\n**{selected}** · Chat naturally here. Mention me when you want a direct answer.\n"
+            f"{mentions}\n**{selected}** · Chat naturally here. Every participant’s message gets a direct answer.\n"
             "This thread has its own context. Use `/history` to inspect it, "
             "`/model` to switch routes, and `/reset` to start fresh. Answers have Retry and Edit prompt buttons.",
             allowed_mentions=discord.AllowedMentions(
@@ -360,6 +529,21 @@ class Together(discord.Client):
             revised = turn["prompt"] if prompt is None else prompt
             if prompt is not None and revised == turn["prompt"]:
                 return channel
+            source_message = None
+            budget = {"bytes": 16 * 1024 * 1024}
+            if turn["source_id"]:
+                source_message = await channel.fetch_message(int(turn["source_id"]))
+            images = (
+                await self.source_image_parts(
+                    channel,
+                    source_message.id,
+                    budget,
+                    source=source_message,
+                    refresh=True,
+                )
+                if source_message
+                else []
+            )
             output_ids = json.loads(turn["output_ids"])
             if isinstance(channel, discord.Thread):
                 anchor = (
@@ -405,11 +589,15 @@ class Together(discord.Client):
                 ):
                     prompt_annotation = None
             context = self.store.history(
-                room, exclude_source=turn["source_id"], exclude_turn=key
+                room,
+                exclude_source=turn["source_id"],
+                exclude_turn=key,
+                with_sources=True,
             )
             epoch = self.room_epochs.get(room, 0)
             try:
                 async with self.slots, channel.typing():
+                    context = await self.image_history(channel, context, budget)
                     selected, answer, raw = await self.engine.ask(
                         room,
                         revised,
@@ -417,12 +605,33 @@ class Together(discord.Client):
                         model or turn["model"],
                         turn["skill"],
                         history=context,
+                        images=images,
                         persist=False,
                         casual=not isinstance(channel, discord.Thread),
                     )
-            except Exception:
+            except Exception as error:
+                if epoch != self.room_epochs.get(room, 0):
+                    return channel
                 self.store.fail_turn(key)
-                raise
+                failure = "I couldn't regenerate that answer. " + safe_error(error)
+                current_turn = self.store.turn(key)
+                if current_turn is None:
+                    return channel
+                output = await self.render_turn(
+                    key,
+                    model or turn["model"],
+                    failure,
+                    {"error": safe_error(error)},
+                    send=channel.send,
+                    version=current_turn["version"],
+                    prompt_annotation=prompt_annotation,
+                )
+                with self.store.db:
+                    self.store.db.execute(
+                        "UPDATE turns SET answer=?,output_ids=? WHERE key=?",
+                        (failure, json.dumps([output.id]), key),
+                    )
+                return channel
             if epoch != self.room_epochs.get(room, 0):
                 return channel
             output = await self.render_turn(
@@ -440,6 +649,19 @@ class Together(discord.Client):
             return channel
 
     async def delete_messages(self, channel, targets):
+        targets = [
+            message
+            for message in targets
+            if not (
+                callable(getattr(message, "is_system", None)) and message.is_system()
+            )
+            and getattr(message, "type", None)
+            not in {
+                discord.MessageType.recipient_add,
+                discord.MessageType.recipient_remove,
+                discord.MessageType.thread_starter_message,
+            }
+        ]
         permissions = channel.permissions_for(channel.guild.me)
         if not permissions.manage_messages and any(
             m.author.id != self.user.id for m in targets
@@ -453,16 +675,23 @@ class Together(discord.Client):
                 await message.delete()
             except discord.NotFound:
                 pass
+            except discord.HTTPException as error:
+                self.internal_deletes.discard(message.id)
+                if error.code == 50021:
+                    continue
+                raise
             except Exception:
                 self.internal_deletes.discard(message.id)
                 raise
             self.store.remove_message(message.id)
 
     async def on_raw_message_delete(self, event):
+        self.invalidate_image_cache(event.message_id)
         await self.remove_deleted_message(event.channel_id, event.message_id)
 
     async def on_raw_bulk_message_delete(self, event):
         for message_id in event.message_ids:
+            self.invalidate_image_cache(message_id)
             await self.remove_deleted_message(event.channel_id, message_id)
 
     async def remove_deleted_message(self, channel_id, message_id):
@@ -488,7 +717,9 @@ class Together(discord.Client):
                 await self.delete_messages(channel, outputs)
 
     async def on_raw_message_edit(self, event):
-        if "content" not in event.data:
+        self.invalidate_image_cache(event.message_id)
+        attachments_updated = "attachments" in event.data
+        if "content" not in event.data and not attachments_updated:
             return
         if not self.store.has_message(
             event.message_id
@@ -504,6 +735,8 @@ class Together(discord.Client):
             if source.author.bot:
                 return
             prompt = re.sub(rf"<@!?{self.user.id}>", "", source.content).strip()
+            if not prompt and has_image_attachment(source):
+                prompt = "Describe the attached image."
             edited_at = source.edited_at.isoformat() if source.edited_at else None
             stored = self.store.db.execute(
                 "SELECT content,edited_at FROM messages WHERE source_id=?",
@@ -514,6 +747,7 @@ class Together(discord.Client):
             if (
                 stored
                 and stored["content"] == f"{source.author.display_name}: {prompt}"
+                and not attachments_updated
             ):
                 self.store.observe(
                     room, source.id, source.author.display_name, prompt, edited_at
@@ -524,7 +758,10 @@ class Together(discord.Client):
                 room, source.id, source.author.display_name, prompt, edited_at
             )
             if turn:
-                await self.revise_turn(turn["key"], source.author, prompt)
+                revised = (
+                    None if attachments_updated and prompt == turn["prompt"] else prompt
+                )
+                await self.revise_turn(turn["key"], source.author, revised)
             else:
                 if isinstance(source_channel, discord.Thread):
                     async with self.room_locks.setdefault(room, asyncio.Lock()):
@@ -637,7 +874,7 @@ class Together(discord.Client):
             or message.guild.id != int(self.config["guild_id"])
         ):
             return
-        if not message.content.strip():
+        if not message.content.strip() and not has_image_attachment(message):
             return
         if self.store.has_message(message.id):
             return
@@ -656,12 +893,14 @@ class Together(discord.Client):
             isinstance(message.channel, discord.TextChannel)
             and message.channel.permissions_for(message.guild.default_role).view_channel
         )
-        directed = self.user in message.mentions or replied
+        directed = in_thread or self.user in message.mentions or replied
         if not directed and not public_channel and not in_thread:
             return
         if self.store.turn_by_source(message.id):
             return
         prompt = re.sub(rf"<@!?{self.user.id}>", "", message.content).strip()
+        if not prompt and has_image_attachment(message):
+            prompt = "Describe the attached image."
         self.store.observe(room, message.id, message.author.display_name, prompt)
         if not directed:
             if public_channel or in_thread:
@@ -845,7 +1084,7 @@ class Together(discord.Client):
                 i.channel, title, i.user, people, model
             )
             await i.followup.send(
-                f"Your conversation is ready in {thread.mention}. Chat normally there, and mention me when you want a direct answer."
+                f"Your conversation is ready in {thread.mention}. Chat normally there without mentioning me."
             )
             if message:
                 opening = await thread.send(

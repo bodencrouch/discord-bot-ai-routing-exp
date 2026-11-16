@@ -15,7 +15,13 @@ import httpx
 
 CONTEXT_HASH_VERSION = 2
 
-PRIVATE_FIELDS = {"discord_token_file", "api_key_file", "database"}
+PRIVATE_FIELDS = {
+    "discord_token_file",
+    "api_key_file",
+    "token_file",
+    "database",
+    "dashboard_login_file",
+}
 CONFIG_FIELDS = {
     "default_model",
     "aliases",
@@ -341,6 +347,26 @@ class Changes:
     def __init__(self, config):
         self.config = config
         self.root = Path(config["target"]).resolve()
+        self.private_paths = {
+            self.root / name
+            for name in (
+                "config.json",
+                "parent.config.json",
+                "hub.json",
+            )
+        }
+        settings = [config]
+        child_config = self.root / "config.json"
+        if child_config.is_file():
+            settings.append(json.loads(child_config.read_text()))
+        for values in settings:
+            for key in PRIVATE_FIELDS:
+                value = values.get(key)
+                if isinstance(value, str) and value:
+                    self.private_paths.add((self.root / value).resolve())
+        for key in ("PARENT_CONFIG", "BOT_HUB_CONFIG"):
+            if os.environ.get(key):
+                self.private_paths.add((self.root / os.environ[key]).resolve())
         self.http = PlanningHTTPClient(timeout=240)
 
     def snapshot(self):
@@ -350,7 +376,7 @@ class Changes:
                 name
                 for name in subdirs
                 if not name.startswith(".")
-                and name not in {"parent_ai", "__pycache__", "node_modules"}
+                and name not in {"__pycache__", "node_modules"}
                 and not (Path(directory) / name).is_symlink()
             ]
             for name in names:
@@ -380,36 +406,36 @@ class Changes:
         ):
             return False
         if any(
-            part.startswith(".") or part in {"parent_ai", "__pycache__", "node_modules"}
+            part.startswith(".") or part in {"__pycache__", "node_modules"}
             for part in path.parts
         ):
             return False
-        if name in {
-            "config.json",
-            "parent.config.example.json",
-            "skill-issue-department.service",
-        }:
+        absolute = self.root / path
+        if absolute.resolve() in self.private_paths or any(
+            candidate.is_symlink()
+            for candidate in (absolute, *absolute.parents)
+            if candidate.is_relative_to(self.root)
+        ):
             return False
         if any(
             word in name.lower()
-            for word in ("token", "secret", "credential", ".sqlite")
+            for word in ("token", "secret", "credential", ".sqlite", ".db")
         ):
             return False
-        return (
-            path.suffix
-            in {
-                ".py",
-                ".md",
-                ".json",
-                ".toml",
-                ".lock",
-                ".service",
-                ".yml",
-                ".yaml",
-                ".txt",
-            }
-            or name == "together-ai"
-        )
+        return path.suffix in {
+            ".py",
+            ".js",
+            ".css",
+            ".html",
+            ".md",
+            ".json",
+            ".toml",
+            ".lock",
+            ".service",
+            ".yml",
+            ".yaml",
+            ".txt",
+        } or name in {"together-ai", "bot-hub"}
 
     @staticmethod
     def digest(snapshot):
@@ -652,16 +678,17 @@ class Changes:
         )
         guidance = await self.hook(request, f"skill-issue-{job_id}")
         await emit("Hook completed. Starting a tool-using planning session.")
-        system = """You are Skill Issue Department, the parent maintenance agent for Together AI.
+        system = """You are Skill Issue Department, the maintenance agent for the complete Together AI application, including your own implementation.
 Read and search the source using the supplied tools. Determine the user's intended change and inspect the relevant implementation before proposing it.
 Use stage_edit to make precise replacements in a draft. Call finish_change with summary/questions/config when ready. Its staged edits become the proposal. You can also return complete JSON with summary/questions/files/config. Inspect only relevant code, then implement. Avoid repeatedly reading the same source.
 Files maps relative filenames to COMPLETE replacement contents. Config contains only changed allowed settings.
 If clarification is necessary, return questions and empty files/config. Do not claim changes have been applied.
-Changes require explicit requester/admin approval. Keep existing behavior except what was requested.
-You can edit all listed child project files, including source, documentation, dependency manifests and the child service unit. All visible child settings can be modified, including gateway URL, model routes, aliases, connectors, skills and persona paths. Credential values stay in their existing private files.
-Parent runtime files and credential contents are outside this interface.
+Present an editable proposal and diff for explicit requester/admin approval before installation. Keep existing behavior except what was requested.
+Executable validation here covers proposal structure and Python syntax. Deployment checks Discord readiness. Report each executed check with its result; label further interaction tests as planned.
+You can edit all listed application files, including together_ai, parent_ai (your own planning and approval implementation), bot_hub source and web assets, documentation, dependency manifests, configuration examples and service units. All visible settings can be modified, including gateway URL, model routes, aliases, connectors, skills and persona paths. Credential values and runtime databases stay in their existing private files.
+Self-modification follows the same editable diff and explicit approval flow. Preserve durable approval state and restart recovery so an approved update can reconnect and report its result after the application restarts.
 Do not request secrets or add credential access, arbitrary shell execution, or external data export.
-Keep the child READY log and management channel exclusion intact. Dependency changes can be proposed through pyproject.toml.
+Preserve application readiness reporting, durable pending approvals and restart recovery. Keep management channel routing functional. Propose dependency changes through pyproject.toml together with a matching uv.lock. Deployment runs uv sync --locked and rolls back if the approved lockfile does not match the dependency manifest.
 Use the most recent follow-up as the user's current intent. Be concise and lightly memeish.
 """
         c = json.loads((self.root / "config.json").read_text())
@@ -718,7 +745,7 @@ Use the most recent follow-up as the user's current intent. Be concise and light
             [
                 tool(
                     "stage_edit",
-                    "Stage one exact text replacement in a child file. Use empty old_text for a new file.",
+                    "Stage one exact text replacement in an application file, including your own implementation. Use empty old_text for a new file.",
                     {
                         "path": {"type": "string"},
                         "old_text": {"type": "string"},
@@ -744,9 +771,10 @@ Use the most recent follow-up as the user's current intent. Be concise and light
         invalid_proposals = 0
         json_protocol = False
         use_json_format = True
-        route = self.config.get("model", "auto/best-free")
+        configured_route = self.config.get("model", "auto/best-free")
+        route = configured_route
         fallback = self.config.get("planning_fallback_model")
-        route_trace = [{"model": route, "reason": "configured parent route"}]
+        route_trace = [{"model": route, "reason": "configured planning route"}]
         max_turns = max(4, min(int(self.config.get("planning_max_turns", 24)), 40))
         proposal_schema = {
             "summary": "Brief change summary",
@@ -790,19 +818,35 @@ Use the most recent follow-up as the user's current intent. Be concise and light
                         ),
                     }
 
+        def next_route():
+            if fallback != "auto/fast":
+                return None
+            candidate = configured_route if route == fallback else fallback
+            return (
+                candidate
+                if candidate != route and candidate not in attempted_routes
+                else None
+            )
+
         async def use_fallback(reason):
             nonlocal route, invalid_proposals, json_protocol, use_json_format
-            if fallback != "auto/fast" or route == fallback:
+            candidate = next_route()
+            if candidate is None:
                 return False
-            route = fallback
+            route = candidate
+            attempted_routes.add(route)
             invalid_proposals = 0
-            json_protocol = False
             use_json_format = True
+            if route == configured_route:
+                activate_json_protocol()
+            else:
+                json_protocol = False
             route_trace.append({"model": route, "reason": reason})
             await emit(
-                f"The configured route could not complete this planning operation ({reason}). Using authorized fallback {route} for this operation; the parent default remains unchanged."
+                f"The configured route could not complete this planning operation ({reason}). Using authorized fallback {route} for this operation. The configured planning default is {configured_route}."
             )
             messages.append({"role": "user", "content": protocol_help})
+            await save_checkpoint()
             return True
 
         def decode_calls(values):
@@ -1011,8 +1055,10 @@ Use the most recent follow-up as the user's current intent. Be concise and light
                 }
             )
 
+        attempted_routes = {route}
+
         async def request_with_retries(body):
-            slow_route_fallback = route == "auto/best-free" and fallback == "auto/fast"
+            handoff_available = next_route() is not None
             for attempt in range(3):
                 response = None
                 try:
@@ -1024,7 +1070,7 @@ Use the most recent follow-up as the user's current intent. Be concise and light
                     )
                     response = normalize_chat_response(response)
                 except httpx.TransportError as error:
-                    if slow_route_fallback and isinstance(error, httpx.ReadTimeout):
+                    if handoff_available and isinstance(error, httpx.ReadTimeout):
                         raise
                     if attempt == 2:
                         raise
@@ -1052,7 +1098,7 @@ Use the most recent follow-up as the user's current intent. Be concise and light
                     if str(error).startswith("Incomplete planning stream:"):
                         failure += ": " + str(error)
                 else:
-                    if slow_route_fallback and response.status_code == 524:
+                    if handoff_available and response.status_code in {429, 524}:
                         return response
                     if (
                         response.status_code not in {408, 429}
@@ -1080,7 +1126,7 @@ Use the most recent follow-up as the user's current intent. Be concise and light
                             )
                         except (ValueError, TypeError, OverflowError):
                             pass
-                delay = min(10.0, max(0.0, delay) + random.uniform(0, 0.25))
+                delay = min(300.0, max(0.0, delay) + random.uniform(0, 0.25))
                 await emit(
                     f"Transient planning failure on {route} ({failure}, attempt {attempt + 1}/3). Retrying the same request in {delay:.1f}s; the planning checkpoint is preserved."
                 )
@@ -1124,8 +1170,8 @@ Use the most recent follow-up as the user's current intent. Be concise and light
                     or 500 <= response.status_code <= 599
                 ):
                     reason = (
-                        "the route hit HTTP 524 gateway timeout"
-                        if response.status_code == 524
+                        f"the route returned HTTP {response.status_code}"
+                        if response.status_code in {429, 524}
                         else f"HTTP {response.status_code} persisted after three same-route attempts"
                     )
                     if await use_fallback(reason):
@@ -1268,6 +1314,13 @@ Use the most recent follow-up as the user's current intent. Be concise and light
                             "Tool arguments must be an object matching the supplied tool schema."
                         )
                     fingerprint = name + json.dumps(args, sort_keys=True)
+                    if name == "read_file":
+                        current_text = staged.get(
+                            args["path"], base["files"].get(args["path"], "")
+                        )
+                        fingerprint += hashlib.sha256(current_text.encode()).hexdigest()
+                    elif name == "search_source":
+                        fingerprint += self.digest(base["files"] | staged)
                     seen_calls[fingerprint] = seen_calls.get(fingerprint, 0) + 1
                     if seen_calls[fingerprint] > 1 and name not in {
                         "stage_edit",
@@ -1289,7 +1342,7 @@ Use the most recent follow-up as the user's current intent. Be concise and light
                             )
                         if not self.editable(path):
                             raise ValueError(
-                                "Choose a child project file from list_files."
+                                "Choose an editable application file from list_files, or a new source path within the application."
                             )
                         original = staged.get(path, base["files"].get(path, ""))
                         old = args["old_text"]
@@ -1306,8 +1359,13 @@ Use the most recent follow-up as the user's current intent. Be concise and light
                         )
                         result = {
                             "staged": path,
-                            "diff": self.diff(
-                                {"base": base, "plan": {"files": staged, "config": {}}}
+                            "diff": "".join(
+                                difflib.unified_diff(
+                                    original.splitlines(True),
+                                    staged[path].splitlines(True),
+                                    fromfile=path,
+                                    tofile=path,
+                                )
                             ),
                         }
                     elif name == "finish_change":
@@ -1360,7 +1418,7 @@ Use the most recent follow-up as the user's current intent. Be concise and light
                             raise ValueError("A nonempty query is required.")
                         result = [
                             {"path": path, "line": index, "text": line}
-                            for path, text in base["files"].items()
+                            for path, text in (base["files"] | staged).items()
                             for index, line in enumerate(text.splitlines(), 1)
                             if query.casefold() in line.casefold()
                         ][:100]
@@ -1420,7 +1478,7 @@ Use the most recent follow-up as the user's current intent. Be concise and light
             p = Path(name)
             if not self.editable(name):
                 raise ValueError(
-                    "Choose a child project file; parent runtime files are separate."
+                    "Choose an editable application source path. Private configuration, credentials, databases and unsafe paths are excluded."
                 )
             if not isinstance(content, str) or (self.root / p).is_symlink():
                 raise ValueError("Invalid source file in proposal.")
@@ -1481,7 +1539,17 @@ Use the most recent follow-up as the user's current intent. Be concise and light
 
     def write(self, name, text):
         path = self.root / name
+        if not path.resolve().is_relative_to(self.root) or any(
+            candidate.is_symlink()
+            for candidate in (path, *path.parents)
+            if candidate.is_relative_to(self.root)
+        ):
+            raise ValueError(
+                "Cannot write through a symlink or outside the application."
+            )
         temp = path.with_name(path.name + ".parent-tmp")
+        if temp.is_symlink():
+            raise ValueError("Cannot write through a symlinked temporary file.")
         path.parent.mkdir(parents=True, exist_ok=True)
         temp.write_text(text)
         temp.chmod(0o600 if name == "config.json" else 0o644)
@@ -1519,7 +1587,7 @@ Use the most recent follow-up as the user's current intent. Be concise and light
         )
         out, _ = await asyncio.wait_for(process.communicate(), 45)
         if process.returncode:
-            raise RuntimeError("The child service operation failed.")
+            raise RuntimeError("The application service operation failed.")
         return out.decode()
 
     async def restart(self):
