@@ -39,7 +39,17 @@ def progress_icon(message):
         ("📋", ("proposal", "preview", "approval", "approved", "diff")),
         ("🧭", ("hook", "protecting-your-energy")),
         ("📚", ("retrieved", "context", "reading", "read ")),
-        ("🧠", ("model turn", "thinking", "planning", "route", "protocol")),
+        (
+            "🧠",
+            (
+                "model turn",
+                "thinking",
+                "planning",
+                "stream active",
+                "route",
+                "protocol",
+            ),
+        ),
         ("🛑", ("cancelled",)),
     )
     for icon, terms in categories:
@@ -832,14 +842,18 @@ class Parent(discord.Client):
                     self.activity_messages.get(job_id),
                 )
 
-            proposal = await self.changes.propose(
-                job["request"],
-                job_id,
-                lambda message: self.progress(job_id, message),
-                context=context,
-                resume=resume["state"] if resume else None,
-                checkpoint=checkpoint,
+            thread = self.get_channel(job["thread"]) or await self.fetch_channel(
+                job["thread"]
             )
+            async with thread.typing():
+                proposal = await self.changes.propose(
+                    job["request"],
+                    job_id,
+                    lambda message: self.progress(job_id, message),
+                    context=context,
+                    resume=resume["state"] if resume else None,
+                    checkpoint=checkpoint,
+                )
             if (
                 self.get(job_id)["version"] != version
                 or self.get(job_id)["state"] != "planning"

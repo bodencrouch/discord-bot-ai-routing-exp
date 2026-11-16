@@ -15,6 +15,7 @@ from discord import app_commands
 
 
 from parent_ai.__main__ import Parent
+from parent_ai.changes import normalize_chat_response
 from together_ai.hub import HubTogether, telemetry_value
 from .presets import PRESETS
 
@@ -43,6 +44,7 @@ class HubParent(Parent):
                         "model.failed", {"model": model, "status": response.status_code}
                     )
                     return response
+                response = normalize_chat_response(response)
                 payload = response.json()
                 self.emit(
                     "model.completed",
@@ -57,7 +59,14 @@ class HubParent(Parent):
                 return response
             except Exception as error:
                 self.emit(
-                    "model.failed", {"model": model, "error": type(error).__name__}
+                    "model.failed",
+                    {
+                        "model": model,
+                        "error": type(error).__name__,
+                        "detail": str(error)
+                        if str(error).startswith("Incomplete planning stream:")
+                        else None,
+                    },
                 )
                 raise
 

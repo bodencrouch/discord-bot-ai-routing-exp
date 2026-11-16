@@ -1,10 +1,11 @@
 {
-  "guild_id": 1571748579570221107,
-  "channel_id": 1571760182248218634,
-  "target": "/absolute/path/to/together-ai",
-  "database": "/absolute/private/parent.sqlite",
-  "token_file": "/absolute/private/parent-token",
-  "energy_hook": "/absolute/path/to/protecting-your-energy/hooks/energy.py",
-  "model": "auto/best-free",
-  "planning_fallback_model": "auto/fast"
+    "guild_id": 1571748579570221107,
+    "channel_id": 1571760182248218634,
+    "target": "/absolute/path/to/together-ai",
+    "database": "/absolute/private/parent.sqlite",
+    "token_file": "/absolute/private/parent-token",
+    "energy_hook": "/absolute/path/to/protecting-your-energy/hooks/energy.py",
+    "model": "auto/best-free",
+    "planning_fallback_model": "auto/fast",
+    "planning_reasoning_effort": "low",
 }

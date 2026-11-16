@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 import random
+import re
 import time
 from email.utils import parsedate_to_datetime
 import sys
@@ -30,6 +31,308 @@ CONFIG_FIELDS = {
 }
 
 
+def normalize_chat_response(response):
+    """Assemble a buffered OpenAI-compatible SSE response into ordinary JSON."""
+    is_stream = "text/event-stream" in response.headers.get("content-type", "").lower()
+    if not response.is_success or not (
+        is_stream or response.content.lstrip().startswith(b"data:")
+    ):
+        return response
+    choices, metadata = {}, {}
+    done = False
+
+    def interrupted(reason):
+        try:
+            request = response.request
+        except RuntimeError:
+            request = None
+        diagnostics = {
+            "model": metadata.get("model"),
+            "finish_reasons": [
+                choice.get("finish_reason") for choice in choices.values()
+            ],
+            "usage": metadata.get("usage"),
+            "visible_chars": sum(
+                len(choice["message"].get("content") or "")
+                for choice in choices.values()
+            ),
+            "tool_argument_chars": sum(
+                len(tool["function"]["arguments"])
+                for choice in choices.values()
+                for tool in choice.get("tools", {}).values()
+            ),
+            "done": done,
+        }
+        usage = diagnostics["usage"] or {}
+        counts = {
+            key: usage[key]
+            for key in ("prompt_tokens", "completion_tokens", "total_tokens")
+            if isinstance(usage, dict) and key in usage
+        }
+        detail = {
+            "model": diagnostics["model"],
+            "finish_reasons": diagnostics["finish_reasons"],
+            "tokens": counts,
+            "visible_chars": diagnostics["visible_chars"],
+            "tool_argument_chars": diagnostics["tool_argument_chars"],
+        }
+        error = httpx.ReadError(
+            "Incomplete planning stream: "
+            + reason
+            + ". Diagnostics "
+            + json.dumps(detail),
+            request=request,
+        )
+        error.completion_diagnostics = diagnostics
+        return error
+
+    for event in response.text.replace("\r\n", "\n").replace("\r", "\n").split("\n\n"):
+        data = "\n".join(
+            line[5:].lstrip(" ")
+            for line in event.split("\n")
+            if line.startswith("data:")
+        )
+        if not data:
+            continue
+        if any(
+            line.startswith("event:") and line[6:].strip() == "error"
+            for line in event.split("\n")
+        ):
+            raise interrupted("the provider emitted an error event")
+        if data.strip() == "[DONE]":
+            done = True
+            break
+        try:
+            chunk = json.loads(data)
+        except (ValueError, TypeError) as error:
+            raise interrupted("invalid SSE event JSON") from error
+        if (
+            not isinstance(chunk, dict)
+            or chunk.get("error")
+            or chunk.get("type") == "error"
+        ):
+            raise interrupted("the provider emitted an error event")
+        if chunk.get("model") == "keepalive":
+            continue
+        for key in ("id", "model", "created", "system_fingerprint", "usage"):
+            if chunk.get(key) is not None:
+                metadata[key] = chunk[key]
+        for item in chunk.get("choices", []):
+            index = item.get("index", 0)
+            choice = choices.setdefault(
+                index,
+                {
+                    "index": index,
+                    "message": {"role": "assistant", "content": ""},
+                    "finish_reason": None,
+                    "tools": {},
+                },
+            )
+            delta = item.get("delta") or item.get("message") or {}
+            if delta.get("role"):
+                choice["message"]["role"] = delta["role"]
+            content = delta.get("content")
+            if isinstance(content, str):
+                choice["message"]["content"] += content
+            elif isinstance(content, list):
+                choice["message"]["content"] += "".join(
+                    part.get("text", "")
+                    for part in content
+                    if isinstance(part, dict) and isinstance(part.get("text"), str)
+                )
+            for fragment in delta.get("tool_calls") or []:
+                tool = choice["tools"].setdefault(
+                    fragment.get("index", 0),
+                    {
+                        "id": "",
+                        "type": "function",
+                        "function": {"name": "", "arguments": ""},
+                    },
+                )
+                if fragment.get("id"):
+                    tool["id"] += fragment["id"]
+                function = fragment.get("function") or {}
+                if function.get("name"):
+                    tool["function"]["name"] += function["name"]
+                arguments = function.get("arguments")
+                if arguments is not None:
+                    tool["function"]["arguments"] += (
+                        arguments
+                        if isinstance(arguments, str)
+                        else json.dumps(arguments)
+                    )
+            if item.get("finish_reason") is not None:
+                choice["finish_reason"] = item["finish_reason"]
+    if not done:
+        raise interrupted("the connection ended before [DONE]")
+    if not choices:
+        raise interrupted("the provider returned no completion choices")
+    assembled = []
+    for index in sorted(choices):
+        choice = choices[index]
+        if choice["finish_reason"] == "length":
+            raise interrupted("the completion hit its output length limit")
+        if choice["finish_reason"] in {None, "content_filter"}:
+            raise interrupted("the completion did not finish or was filtered")
+        tools = choice.pop("tools")
+        if tools:
+            choice["message"]["tool_calls"] = [tools[key] for key in sorted(tools)]
+            if not choice["message"]["content"]:
+                choice["message"]["content"] = None
+        assembled.append(choice)
+    payload = dict(metadata, object="chat.completion", choices=assembled)
+    headers = {
+        key: value
+        for key, value in response.headers.items()
+        if key.lower() not in {"content-type", "content-length", "content-encoding"}
+    }
+    try:
+        request = response.request
+    except RuntimeError:
+        request = None
+    return httpx.Response(
+        response.status_code,
+        json=payload,
+        headers=headers,
+        request=request,
+        extensions=response.extensions,
+    )
+
+
+class PlanningHTTPClient(httpx.AsyncClient):
+    """Read planning SSE to its terminal event, independently of socket EOF."""
+
+    async def post(self, url, **kwargs):
+        progress = kwargs.pop("planning_progress", None)
+        body = kwargs.get("json")
+        if not isinstance(body, dict) or not body.get("stream"):
+            return await super().post(url, **kwargs)
+        started = time.monotonic()
+        stats = {"visible_chars": 0, "tool_argument_chars": 0, "events": 0}
+        names = {}
+        heartbeat = None
+        previous = dict(stats)
+
+        async def report(message):
+            if progress:
+                await progress(message)
+
+        async def pulse():
+            while True:
+                await asyncio.sleep(30)
+                if stats["tool_argument_chars"] > previous["tool_argument_chars"]:
+                    activity = "receiving visible tool arguments"
+                elif stats["visible_chars"] > previous["visible_chars"]:
+                    activity = "receiving visible response text"
+                else:
+                    activity = "still processing, waiting for new visible output"
+                tool_names = ", ".join(sorted(set(names.values()))) or "none yet"
+                await report(
+                    f"Stream active for {time.monotonic() - started:.0f}s · {activity} · "
+                    f"visible text {stats['visible_chars']} characters · tool arguments {stats['tool_argument_chars']} characters · tools {tool_names}"
+                )
+                previous.update(stats)
+
+        def inspect_event(data):
+            try:
+                chunk = json.loads(data)
+            except (ValueError, TypeError):
+                return
+            if not isinstance(chunk, dict) or chunk.get("model") == "keepalive":
+                return
+            stats["events"] += 1
+            for choice in chunk.get("choices", []) or []:
+                if not isinstance(choice, dict):
+                    continue
+                delta = choice.get("delta") or {}
+                if not isinstance(delta, dict):
+                    continue
+                content = delta.get("content")
+                if isinstance(content, str):
+                    stats["visible_chars"] += len(content)
+                for position, tool in enumerate(delta.get("tool_calls") or []):
+                    function = tool.get("function") or {}
+                    key = (choice.get("index", 0), tool.get("index", position))
+                    if isinstance(function.get("name"), str):
+                        names[key] = re.sub(
+                            r"[^A-Za-z0-9_-]", "", names.get(key, "") + function["name"]
+                        )[:80]
+                    if isinstance(function.get("arguments"), str):
+                        stats["tool_argument_chars"] += len(function["arguments"])
+
+        try:
+            async with self.stream("POST", url, **kwargs) as response:
+                if (
+                    not response.is_success
+                    or "text/event-stream"
+                    not in response.headers.get("content-type", "").lower()
+                ):
+                    await response.aread()
+                    return response
+                await report(
+                    "Planning stream connected. Waiting for visible model output."
+                )
+                if progress:
+                    heartbeat = asyncio.create_task(pulse())
+                lines, event_data = [], []
+                async for line in response.aiter_lines():
+                    lines.append(line)
+                    if line.startswith("data:"):
+                        data = line[5:].strip()
+                        if data == "[DONE]":
+                            lines.append("")
+                            break
+                        event_data.append(line[5:].lstrip(" "))
+                    elif not line and event_data:
+                        inspect_event("\n".join(event_data))
+                        event_data.clear()
+                headers = {
+                    key: value
+                    for key, value in response.headers.items()
+                    if key.lower() not in {"content-length", "content-encoding"}
+                }
+                buffered = httpx.Response(
+                    response.status_code,
+                    headers=headers,
+                    text="\n".join(lines),
+                    request=response.request,
+                    extensions=response.extensions,
+                )
+                normalized = normalize_chat_response(buffered)
+            payload = normalized.json()
+            reasons = [
+                choice.get("finish_reason") for choice in payload.get("choices", [])
+            ]
+            usage = payload.get("usage") or {}
+            counts = {
+                key: usage[key]
+                for key in ("prompt_tokens", "completion_tokens", "total_tokens")
+                if isinstance(usage, dict) and key in usage
+            }
+            await report(
+                f"Planning stream completed in {time.monotonic() - started:.1f}s · finish reasons {json.dumps(reasons)} · token usage {json.dumps(counts)}"
+            )
+            return normalized
+        except httpx.TransportError as error:
+            diagnostics = getattr(error, "completion_diagnostics", {})
+            usage = diagnostics.get("usage") or {}
+            counts = {
+                key: usage[key]
+                for key in ("prompt_tokens", "completion_tokens", "total_tokens")
+                if isinstance(usage, dict) and key in usage
+            }
+            await report(
+                f"Planning stream stopped after {time.monotonic() - started:.1f}s · {type(error).__name__} · "
+                f"finish reasons {json.dumps(diagnostics.get('finish_reasons', []))} · "
+                f"visible text {stats['visible_chars']} characters · tool arguments {stats['tool_argument_chars']} characters · token usage {json.dumps(counts)}"
+            )
+            raise
+        finally:
+            if heartbeat:
+                heartbeat.cancel()
+                await asyncio.gather(heartbeat, return_exceptions=True)
+
+
 class StaleProposal(ValueError):
     pass
 
@@ -38,7 +341,7 @@ class Changes:
     def __init__(self, config):
         self.config = config
         self.root = Path(config["target"]).resolve()
-        self.http = httpx.AsyncClient(timeout=240)
+        self.http = PlanningHTTPClient(timeout=240)
 
     def snapshot(self):
         files = {}
@@ -675,13 +978,37 @@ Use the most recent follow-up as the user's current intent. Be concise and light
                         c["base_url"].rstrip("/") + "/chat/completions",
                         headers=headers,
                         json=body,
+                        planning_progress=emit,
                     )
+                    response = normalize_chat_response(response)
                 except httpx.TransportError as error:
                     if slow_route_fallback and isinstance(error, httpx.ReadTimeout):
                         raise
                     if attempt == 2:
                         raise
+                    if str(error).startswith(
+                        "Incomplete planning stream: the completion hit its output length limit"
+                    ):
+                        messages.append(
+                            {
+                                "role": "user",
+                                "content": (
+                                    "The last streamed output exceeded its output limit and was discarded. "
+                                    "Preserve all existing staged edits. Continue with a small batch of focused stage_edit calls, "
+                                    "using short, exact, unique old_text fragments and their replacement new_text. "
+                                    "Avoid repeating full source files or large old/new bodies. Inspect limited relevant line ranges "
+                                    "if needed. Use finish_change after the remaining edits are staged, rather than serializing "
+                                    "the entire files map. Return complete small tool calls that fit the existing output budget."
+                                ),
+                            }
+                        )
+                        await emit(
+                            "The response reached its output limit. Retrying with smaller incremental edits and the current staged draft."
+                        )
+                        await save_checkpoint()
                     failure = type(error).__name__
+                    if str(error).startswith("Incomplete planning stream:"):
+                        failure += ": " + str(error)
                 else:
                     if slow_route_fallback and response.status_code == 524:
                         return response
@@ -722,7 +1049,14 @@ Use the most recent follow-up as the user's current intent. Be concise and light
             attempt_turns += 1
             turn += 1
             await emit(f"Model turn {turn}: requesting the next action from {route}.")
-            body = {"model": route, "max_tokens": 24000, "messages": messages}
+            body = {
+                "model": route,
+                "max_tokens": 24000,
+                "messages": messages,
+                "stream": True,
+            }
+            if self.config.get("planning_reasoning_effort"):
+                body["reasoning_effort"] = self.config["planning_reasoning_effort"]
             if json_protocol:
                 if use_json_format:
                     body["response_format"] = {"type": "json_object"}
