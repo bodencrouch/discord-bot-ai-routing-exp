@@ -27,6 +27,7 @@ Editing an earlier thread prompt rewinds the thread, removes later messages, and
 `/participation` adjusts how often I join in. Mentions and direct replies still get an answer.
 `/models` finds available routes. `/model` selects this channel's route.
 `/routes` lists favorites and manages route aliases.
+`/modify request` opens a reviewed change to this bot’s own code and settings. Review the diff, refine it, then approve to apply.
 `/skills` lists skills. `/skill` runs one. You can also write `@Together AI @explain your question`.
 `/connectors` lists connected tools. `/tool` calls a tool with JSON arguments.
 `/summarize` summarizes recent channel messages. `/reset` clears AI conversation context.
