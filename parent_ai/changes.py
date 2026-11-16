@@ -667,6 +667,7 @@ Use the most recent follow-up as the user's current intent. Be concise and light
             )
 
         async def request_with_retries(body):
+            slow_route_fallback = route == "auto/best-free" and fallback == "auto/fast"
             for attempt in range(3):
                 response = None
                 try:
@@ -676,10 +677,14 @@ Use the most recent follow-up as the user's current intent. Be concise and light
                         json=body,
                     )
                 except httpx.TransportError as error:
+                    if slow_route_fallback and isinstance(error, httpx.ReadTimeout):
+                        raise
                     if attempt == 2:
                         raise
                     failure = type(error).__name__
                 else:
+                    if slow_route_fallback and response.status_code == 524:
+                        return response
                     if (
                         response.status_code not in {408, 429}
                         and not 500 <= response.status_code <= 599
@@ -727,9 +732,12 @@ Use the most recent follow-up as the user's current intent. Be concise and light
             try:
                 response = await request_with_retries(body)
             except httpx.TransportError as error:
-                if await use_fallback(
-                    "transport failures persisted after three same-route attempts"
-                ):
+                reason = (
+                    "the route hit a read timeout"
+                    if isinstance(error, httpx.ReadTimeout)
+                    else "transport failures persisted after three same-route attempts"
+                )
+                if await use_fallback(reason):
                     continue
                 raise RuntimeError(
                     f"Planning route {route} failed after three transport attempts. Retry can resume the preserved planning checkpoint."
@@ -739,9 +747,12 @@ Use the most recent follow-up as the user's current intent. Be concise and light
                     response.status_code in {408, 429}
                     or 500 <= response.status_code <= 599
                 ):
-                    if await use_fallback(
-                        f"HTTP {response.status_code} persisted after three same-route attempts"
-                    ):
+                    reason = (
+                        "the route hit HTTP 524 gateway timeout"
+                        if response.status_code == 524
+                        else f"HTTP {response.status_code} persisted after three same-route attempts"
+                    )
+                    if await use_fallback(reason):
                         continue
                     raise RuntimeError(
                         f"Planning route {route} returned HTTP {response.status_code} after three attempts. Retry can resume the preserved planning checkpoint."
