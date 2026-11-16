@@ -172,7 +172,21 @@ class Together(discord.Client):
         version=None,
         prompt_annotation=None,
     ):
-        heading = f"**{model}**"
+        actual_model = (
+            next(
+                (
+                    entry.get("model")
+                    for entry in reversed(raw)
+                    if isinstance(entry, dict) and entry.get("model")
+                ),
+                None,
+            )
+            if isinstance(raw, list)
+            else None
+        )
+        heading = f"**{actual_model or model}**"
+        if actual_model and actual_model != model:
+            heading += f" · route `{model}`"
         content = heading + "\n" + answer
         turn = self.store.turn(key)
         if turn and isinstance(
@@ -734,7 +748,7 @@ class Together(discord.Client):
         tree, engine, store = self.tree, self.engine, self.store
 
         async def autocomplete(interaction, current):
-            values = list(self.config.get("aliases", {})) + engine.models
+            values = engine.models
             return [
                 app_commands.Choice(name=v[:100], value=v)
                 for v in values
@@ -744,14 +758,9 @@ class Together(discord.Client):
         async def media_autocomplete(interaction, current):
             kind = interaction.command.name
             models = engine.media_models(kind)
-            aliases = [
-                alias
-                for alias, route in self.config.get("aliases", {}).items()
-                if route in models
-            ]
             return [
                 app_commands.Choice(name=value[:100], value=value)
-                for value in aliases + models
+                for value in models
                 if current.lower() in value.lower() and len(value) <= 100
             ][:25]
 

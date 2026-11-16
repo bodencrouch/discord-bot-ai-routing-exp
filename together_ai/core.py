@@ -386,9 +386,7 @@ class Engine:
     async def refresh_models(self):
         response = await self.http.get(self.config["base_url"] + "/models")
         response.raise_for_status()
-        self.catalog = [
-            m for m in response.json()["data"] if not m["id"].endswith(":batch")
-        ]
+        self.catalog = [m for m in response.json()["data"]]
         self.models = [m["id"] for m in self.catalog]
 
     def media_models(self, kind):
@@ -399,7 +397,11 @@ class Engine:
         ]
 
     def resolve_model(self, model):
-        resolved = self.config.get("aliases", {}).get(model, model)
+        resolved = (
+            model
+            if model in self.models
+            else self.config.get("aliases", {}).get(model, model)
+        )
         if resolved not in self.models:
             raise ValueError("Unknown model. Use /models to find one.")
         return resolved
@@ -603,7 +605,11 @@ class Engine:
             raise ValueError(
                 f"Choose a {kind} route in the model option. A default can also be configured with the terminal media command."
             )
-        selected = self.config.get("aliases", {}).get(route, route)
+        selected = (
+            route
+            if route in self.models
+            else self.config.get("aliases", {}).get(route, route)
+        )
         metadata = next((m for m in self.catalog if m["id"] == selected), None)
         if (
             metadata

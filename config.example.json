@@ -3,15 +3,12 @@
   "base_url": "https://omniroute-edge.bodecloud.workers.dev/v1",
   "default_model": "auto/fast",
   "media_defaults": {},
-  "participation": {"level": "quiet", "cooldown": 60, "delay": 6},
-  "aliases": {
-    "auto": "auto/chat",
-    "fast": "auto/fast",
-    "code": "auto/coding",
-    "claude": "auto/claude-sonnet",
-    "gpt": "auto/gpt",
-    "gemini": "auto/gemini"
+  "participation": {
+    "level": "quiet",
+    "cooldown": 60,
+    "delay": 6
   },
+  "aliases": {},
   "discord_token_file": "/absolute/private/discord-token",
   "api_key_file": "/absolute/private/ai-key",
   "database": "/absolute/private/conversations.sqlite",
@@ -20,7 +17,10 @@
     {
       "name": "web",
       "url": "https://mcp.exa.ai/mcp",
-      "allowed_tools": ["web_search_exa", "web_fetch_exa"]
+      "allowed_tools": [
+        "web_search_exa",
+        "web_fetch_exa"
+      ]
     }
   ],
   "skills": {}

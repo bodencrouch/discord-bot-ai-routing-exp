@@ -67,9 +67,9 @@ class RequestButton(
                 "The requester or a server administrator can manage this change."
             )
             return
-        if job["version"] != self.version or job["state"] in {"applying", "planning"}:
+        if job["version"] != self.version or job["state"] == "applying":
             await interaction.response.send_message(
-                "This preview has changed or is being processed. Use the latest card when it is ready."
+                f"This is an older revision or deployment is in progress. Current status: **{job['state']}**, revision {job['version']}. Open <#{job['thread']}> for the live controls and activity."
             )
             return
         if self.action == "edit":
@@ -77,17 +77,16 @@ class RequestButton(
             return
         await interaction.response.defer()
         job = bot.get(self.job)
-        if (
-            not job
-            or job["version"] != self.version
-            or job["state"] in {"applying", "planning"}
-        ):
+        if not job or job["version"] != self.version or job["state"] == "applying":
             await interaction.followup.send(
                 "This preview changed. Use the latest card."
             )
             return
         if self.action == "approve":
             if job["state"] != "awaiting":
+                await interaction.followup.send(
+                    f"Current status is **{job['state']}**. Approval becomes available when the proposal is ready. Follow progress in <#{job['thread']}>."
+                )
                 return
             proposal = json.loads(job["proposal"])
             if bot.changes.digest(bot.changes.snapshot()) != bot.changes.digest(
@@ -262,9 +261,16 @@ class Parent(discord.Client):
         view = discord.ui.View(timeout=None)
         if job["state"] == "awaiting":
             view.add_item(RequestButton(job_id, job["version"], "approve"))
-        if job["state"] not in {"applying", "planning"}:
+        if job["state"] != "applying":
             view.add_item(RequestButton(job_id, job["version"], "edit"))
-        if job["state"] in {"queued", "clarify", "awaiting", "approved", "failed"}:
+        if job["state"] in {
+            "queued",
+            "planning",
+            "clarify",
+            "awaiting",
+            "approved",
+            "failed",
+        }:
             view.add_item(RequestButton(job_id, job["version"], "cancel"))
         if job["state"] == "failed":
             view.add_item(RequestButton(job_id, job["version"], "retry"))
