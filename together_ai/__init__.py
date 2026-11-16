@@ -1,0 +1,1 @@
+"""Together AI Discord bot."""
