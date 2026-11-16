@@ -98,8 +98,10 @@ The separate parent bot accepts explicit @mentions in the management channel `15
 
 The parent runs the installed protecting-your-energy `UserPromptSubmit` hook before each model planning call, uses source listing, reading, searching, settings inspection and proposal validation tools, asks necessary clarifying questions, and attaches a proposed diff. The thread shows actual model responses, tool calls and results, with long output attached as files. Confirmation queues the exact reviewed change. Source changes since review require a fresh proposal and approval. Requests are planned concurrently. Approved deployments are coordinated so changes cannot overwrite each other, and a stale preview requires renewed approval.
 
-The parent can edit Together AI's Python modules, persona and model/participation settings. Its own runtime, credentials, dependencies, service configuration and conversation database are outside the generated patch interface. Deployment restarts Together AI and checks its Discord-ready log. Failure restores the previous files and settings. Interrupted deployments are recovered on parent startup. Request revisions and before-change snapshots persist in a separate private SQLite database.
+The parent can edit Together AI’s project files, dependency manifests, child service unit and non-secret configuration, including gateway URLs, routes, aliases, connectors and skills. Credentials remain in their existing private files. Dependencies are synchronized and the service unit reloaded during deployment. The parent’s own runtime stays separate. Dependency installation or runtime validation failures trigger rollback.
 
 Use Edit request on a completed card or @mention the parent in its thread to refine an implemented change. Each revision needs fresh approval. Changes are recorded locally by the parent in its audit database. Source publication remains an operator action.
 
 The parent runs through `skill-issue-department.service` with `PARENT_CONFIG` pointing at its private configuration. Together AI ignores the management channel and its threads so the parent owns that conversation. Both services run on this host.
+
+The parent defaults to `auto/best-free`. Planning uses staged edits and a finish tool, detects repeated inspection calls, and asks for a final proposal when inspection repeats.

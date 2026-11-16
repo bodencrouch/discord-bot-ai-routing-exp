@@ -535,6 +535,15 @@ class Together(discord.Client):
         await interaction.response.defer(thinking=True)
         async with self.slots, interaction.channel.typing():
             selected, payload = await self.engine.generate(kind, prompt, model)
+        raw_json = json.dumps(payload, ensure_ascii=False, indent=2)
+        raw_data = raw_json.encode()
+        raw_filename = "raw-response.json"
+        if len(raw_data) > interaction.guild.filesize_limit:
+            raw_data = gzip.compress(raw_data)
+            raw_filename = "raw-response.json.gz"
+        raw_file = None
+        if len(raw_data) <= interaction.guild.filesize_limit:
+            raw_file = discord.File(io.BytesIO(raw_data), filename=raw_filename)
         items = payload.get("data", [])
         if isinstance(items, dict):
             items = items.get("data", [])
@@ -589,12 +598,17 @@ class Together(discord.Client):
         summary = (
             f"**{selected}** · {delivered} {kind} result(s)"
             if delivered
-            else f"**{selected}** · Gateway result received. Expand raw JSON for details."
+            else f"**{selected}** · Gateway result received. Full JSON is attached."
         )
-        self.store.save_raw(
-            key, summary, json.dumps(payload, ensure_ascii=False, indent=2)
-        )
-        await interaction.followup.send(summary, view=self.response_view(key))
+        self.store.save_raw(key, summary, raw_json)
+        kwargs = {"view": self.response_view(key)}
+        if raw_file:
+            kwargs["file"] = raw_file
+        else:
+            summary += (
+                "\nThe complete JSON exceeds Discord's upload limit after compression."
+            )
+        await interaction.followup.send(summary, **kwargs)
 
     async def on_message(self, message):
         excluded = {int(value) for value in self.config.get("excluded_channels", [])}

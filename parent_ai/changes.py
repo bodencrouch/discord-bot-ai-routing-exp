@@ -2,12 +2,26 @@ import asyncio
 import difflib
 import hashlib
 import json
+import os
 import sys
 from pathlib import Path
 
 import httpx
 
-CONFIG_FIELDS = {"default_model", "aliases", "participation", "media_defaults"}
+PRIVATE_FIELDS = {"discord_token_file", "api_key_file", "database"}
+CONFIG_FIELDS = {
+    "default_model",
+    "aliases",
+    "participation",
+    "media_defaults",
+    "base_url",
+    "connectors",
+    "skills",
+    "excluded_channels",
+    "routing_snapshot_file",
+    "guild_id",
+    "persona_file",
+}
 
 
 class StaleProposal(ValueError):
@@ -21,14 +35,72 @@ class Changes:
         self.http = httpx.AsyncClient(timeout=240)
 
     def snapshot(self):
-        files = {
-            str(p.relative_to(self.root)): p.read_text()
-            for p in (self.root / "together_ai").rglob("*.py")
-            if not p.is_symlink()
-        }
-        files["persona.md"] = (self.root / "persona.md").read_text()
+        files = {}
+        for directory, subdirs, names in os.walk(self.root):
+            subdirs[:] = [
+                name
+                for name in subdirs
+                if not name.startswith(".")
+                and name not in {"parent_ai", "__pycache__", "node_modules"}
+                and not (Path(directory) / name).is_symlink()
+            ]
+            for name in names:
+                path = Path(directory) / name
+                if (
+                    not self.editable(str(path.relative_to(self.root)))
+                    or path.is_symlink()
+                ):
+                    continue
+                try:
+                    files[str(path.relative_to(self.root))] = path.read_text()
+                except UnicodeError:
+                    continue
         config = json.loads((self.root / "config.json").read_text())
-        return {"files": files, "config": {k: config.get(k) for k in CONFIG_FIELDS}}
+        return {
+            "files": files,
+            "config": {k: v for k, v in config.items() if k not in PRIVATE_FIELDS},
+        }
+
+    def editable(self, name):
+        path = Path(name)
+        if (
+            path.is_absolute()
+            or ".." in path.parts
+            or not path.parts
+            or not (self.root / path).resolve().is_relative_to(self.root)
+        ):
+            return False
+        if any(
+            part.startswith(".") or part in {"parent_ai", "__pycache__", "node_modules"}
+            for part in path.parts
+        ):
+            return False
+        if name in {
+            "config.json",
+            "parent.config.example.json",
+            "skill-issue-department.service",
+        }:
+            return False
+        if any(
+            word in name.lower()
+            for word in ("token", "secret", "credential", ".sqlite")
+        ):
+            return False
+        return (
+            path.suffix
+            in {
+                ".py",
+                ".md",
+                ".json",
+                ".toml",
+                ".lock",
+                ".service",
+                ".yml",
+                ".yaml",
+                ".txt",
+            }
+            or name == "together-ai"
+        )
 
     @staticmethod
     def digest(snapshot):
@@ -85,14 +157,14 @@ class Changes:
         await emit("Hook completed. Starting a tool-using planning session.")
         system = """You are Skill Issue Department, the parent maintenance agent for Together AI.
 Read and search the source using the supplied tools. Determine the user's intended change and inspect the relevant implementation before proposing it.
-Use validate_change to check a complete proposal. Respond with a JSON object containing summary, questions, files and config.
+Use stage_edit to make precise replacements in a draft. Call finish_change with summary/questions/config when ready. Its staged edits become the proposal. You can also return complete JSON with summary/questions/files/config. Inspect only relevant code, then implement. Avoid repeatedly reading the same source.
 Files maps relative filenames to COMPLETE replacement contents. Config contains only changed allowed settings.
 If clarification is necessary, return questions and empty files/config. Do not claim changes have been applied.
 Changes require explicit requester/admin approval. Keep existing behavior except what was requested.
-Allowed files are together_ai/*.py and persona.md. Allowed config fields are default_model, aliases, participation, media_defaults.
-Your own parent code, credentials, service configuration and database are outside this interface.
+You can edit all listed child project files, including source, documentation, dependency manifests and the child service unit. All visible child settings can be modified, including gateway URL, model routes, aliases, connectors, skills and persona paths. Credential values stay in their existing private files.
+Parent runtime files and credential contents are outside this interface.
 Do not request secrets or add credential access, arbitrary shell execution, or external data export.
-Keep the child READY log and management channel exclusion intact. Use installed dependencies.
+Keep the child READY log and management channel exclusion intact. Dependency changes can be proposed through pyproject.toml.
 Use the most recent follow-up as the user's current intent. Be concise and lightly memeish.
 """
         c = json.loads((self.root / "config.json").read_text())
@@ -145,6 +217,33 @@ Use the most recent follow-up as the user's current intent. Be concise and light
                 ["proposal"],
             ),
         ]
+        tools.extend(
+            [
+                tool(
+                    "stage_edit",
+                    "Stage one exact text replacement in a child file. Use empty old_text for a new file.",
+                    {
+                        "path": {"type": "string"},
+                        "old_text": {"type": "string"},
+                        "new_text": {"type": "string"},
+                    },
+                    ["path", "old_text", "new_text"],
+                ),
+                tool(
+                    "finish_change",
+                    "Finish and validate staged edits for approval, or ask clarifying questions.",
+                    {
+                        "summary": {"type": "string"},
+                        "questions": {"type": "array", "items": {"type": "string"}},
+                        "config": {"type": "object"},
+                    },
+                    ["summary", "questions", "config"],
+                ),
+            ]
+        )
+        staged = {}
+        seen_calls = {}
+        force_final = False
         messages = [
             {
                 "role": "system",
@@ -155,18 +254,21 @@ Use the most recent follow-up as the user's current intent. Be concise and light
         headers = {
             "Authorization": "Bearer " + Path(c["api_key_file"]).read_text().strip()
         }
-        for turn in range(16):
+        turn = 0
+        while True:
+            turn += 1
             await emit(
-                f"Model turn {turn + 1}: requesting the next action from {self.config.get('model', 'auto/coding')}."
+                f"Model turn {turn}: requesting the next action from {self.config.get('model', 'auto/best-free')}."
             )
             response = await self.http.post(
                 c["base_url"] + "/chat/completions",
                 headers=headers,
                 json={
-                    "model": self.config.get("model", "auto/coding"),
+                    "model": self.config.get("model", "auto/best-free"),
                     "max_tokens": 24000,
                     "messages": messages,
                     "tools": tools,
+                    "tool_choice": "none" if force_final else "auto",
                 },
             )
             if not response.is_success:
@@ -183,6 +285,7 @@ Use the most recent follow-up as the user's current intent. Be concise and light
                     content = content.split("\n", 1)[1].rsplit("```", 1)[0]
                 try:
                     plan = json.loads(content)
+                    plan["files"] = staged | plan.get("files", {})
                     self.validate(plan)
                 except (ValueError, TypeError, KeyError, SyntaxError) as exc:
                     messages.append({"role": "assistant", "content": content})
@@ -213,13 +316,63 @@ Use the most recent follow-up as the user's current intent. Be concise and light
                 await emit(f"Tool call **{name}**\n```json\n{raw}\n```")
                 try:
                     args = json.loads(raw)
-                    if name == "list_files":
+                    fingerprint = name + json.dumps(args, sort_keys=True)
+                    seen_calls[fingerprint] = seen_calls.get(fingerprint, 0) + 1
+                    if seen_calls[fingerprint] > 1 and name not in {
+                        "stage_edit",
+                        "finish_change",
+                        "validate_change",
+                    }:
+                        force_final = True
+                        raise ValueError(
+                            "This exact inspection already ran. Use the earlier result and finish the proposal now. Return complete JSON on the next turn."
+                        )
+                    if name == "stage_edit":
+                        path = args["path"]
+                        if not self.editable(path):
+                            raise ValueError(
+                                "Choose a child project file from list_files."
+                            )
+                        original = staged.get(path, base["files"].get(path, ""))
+                        old = args["old_text"]
+                        if old and original.count(old) != 1:
+                            raise ValueError(
+                                "old_text must match exactly once. Read the relevant lines and retry."
+                            )
+                        if not old and original:
+                            raise ValueError("Use old_text for existing files.")
+                        staged[path] = (
+                            original.replace(old, args["new_text"], 1)
+                            if old
+                            else args["new_text"]
+                        )
+                        result = {
+                            "staged": path,
+                            "diff": self.diff(
+                                {"base": base, "plan": {"files": staged, "config": {}}}
+                            ),
+                        }
+                    elif name == "finish_change":
+                        plan = {
+                            "summary": args["summary"],
+                            "questions": args["questions"],
+                            "files": staged,
+                            "config": args["config"],
+                        }
+                        self.validate(plan)
+                        await emit(
+                            "Final proposal validated. Preparing the approval controls and diff."
+                        )
+                        return {"base": base, "plan": plan, "hook_applied": True}
+                    elif name == "list_files":
                         result = {
                             "files": list(base["files"]),
                             "settings": sorted(CONFIG_FIELDS),
                         }
                     elif name == "read_file":
-                        lines = base["files"][args["path"]].splitlines(keepends=True)
+                        lines = staged.get(
+                            args["path"], base["files"].get(args["path"], "")
+                        ).splitlines(keepends=True)
                         offset = max(1, int(args.get("offset", 1)))
                         limit = min(500, max(1, int(args.get("limit", 250))))
                         result = {
@@ -261,10 +414,6 @@ Use the most recent follow-up as the user's current intent. Be concise and light
                 messages.append(
                     {"role": "tool", "tool_call_id": call["id"], "content": output}
                 )
-        else:
-            raise RuntimeError(
-                "The planning session reached its 16-turn limit. Retry or refine the request."
-            )
         return {"base": base, "plan": plan, "hook_applied": True}
 
     def validate(self, plan):
@@ -282,23 +431,26 @@ Use the most recent follow-up as the user's current intent. Be concise and light
             )
         for name, content in plan["files"].items():
             p = Path(name)
-            if name != "persona.md" and not (
-                len(p.parts) == 2 and p.parts[0] == "together_ai" and p.suffix == ".py"
-            ):
+            if not self.editable(name):
                 raise ValueError(
-                    "The proposal tried to edit a file outside Together AI."
+                    "Choose a child project file; parent runtime files are separate."
                 )
             if not isinstance(content, str) or (self.root / p).is_symlink():
                 raise ValueError("Invalid source file in proposal.")
             if p.suffix == ".py":
                 compile(content, name, "exec")
-        if set(plan["config"]) - CONFIG_FIELDS:
+        if set(plan["config"]) & PRIVATE_FIELDS:
             raise ValueError("The proposal tried to change protected configuration.")
         for key, value in plan["config"].items():
             if key == "default_model":
                 if not isinstance(value, str) or not value.strip():
                     raise ValueError("The default model must be a route name.")
-            elif not isinstance(value, dict):
+            elif key in {
+                "aliases",
+                "participation",
+                "media_defaults",
+                "skills",
+            } and not isinstance(value, dict):
                 raise ValueError(f"{key} must be a settings object.")
         participation = plan["config"].get("participation", {})
         if "level" in participation and participation["level"] not in {
@@ -343,6 +495,7 @@ Use the most recent follow-up as the user's current intent. Be concise and light
     def write(self, name, text):
         path = self.root / name
         temp = path.with_name(path.name + ".parent-tmp")
+        path.parent.mkdir(parents=True, exist_ok=True)
         temp.write_text(text)
         temp.chmod(0o600 if name == "config.json" else 0o644)
         temp.replace(path)
@@ -367,7 +520,10 @@ Use the most recent follow-up as the user's current intent. Be concise and light
                 (self.root / name).unlink(missing_ok=True)
         c = json.loads((self.root / "config.json").read_text())
         for key in proposal["plan"]["config"]:
-            c[key] = proposal["base"]["config"][key]
+            if key in proposal["base"]["config"]:
+                c[key] = proposal["base"]["config"][key]
+            else:
+                c.pop(key, None)
         self.write("config.json", json.dumps(c, indent=2) + "\n")
 
     async def command(self, *args):
@@ -380,6 +536,8 @@ Use the most recent follow-up as the user's current intent. Be concise and light
         return out.decode()
 
     async def restart(self):
+        await self.command("uv", "sync", "--project", str(self.root))
+        await self.command("systemctl", "--user", "daemon-reload")
         await self.command("systemctl", "--user", "restart", "together-ai")
         invocation = (
             await self.command(

@@ -630,4 +630,13 @@ class Engine:
             raise RuntimeError(
                 f"The {kind} route returned HTTP {response.status_code}. Check that this generation route is connected in OmniRoute."
             )
-        return selected, response.json()
+        payload = response.json()
+        metadata = {
+            key: value
+            for key, value in response.headers.items()
+            if key.lower().startswith("x-omniroute-")
+        }
+        if metadata and isinstance(payload, dict):
+            payload = dict(payload, _omniroute_response_headers=metadata)
+        actual_model = response.headers.get("x-omniroute-model")
+        return actual_model or selected, payload

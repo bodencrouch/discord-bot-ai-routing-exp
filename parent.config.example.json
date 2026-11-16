@@ -5,5 +5,5 @@
   "database": "/absolute/private/parent.sqlite",
   "token_file": "/absolute/private/parent-token",
   "energy_hook": "/absolute/path/to/protecting-your-energy/hooks/energy.py",
-  "model": "auto/coding"
+  "model": "auto/best-free"
 }
