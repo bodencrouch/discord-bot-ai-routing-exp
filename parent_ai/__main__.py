@@ -61,10 +61,10 @@ class RequestButton(
         if (
             not bot.allowed(interaction.channel)
             or not job
-            or interaction.user.id != job["author"]
+            or not bot.can_manage(interaction.user, job)
         ):
             await interaction.response.send_message(
-                "The requester controls this change. @mention me to open your own request."
+                "The requester or a server administrator can manage this change."
             )
             return
         if job["version"] != self.version or job["state"] in {"applying", "planning"}:
@@ -76,6 +76,10 @@ class RequestButton(
             await interaction.response.send_modal(EditRequest(job))
             return
         await interaction.response.defer()
+        job = bot.get(self.job)
+        if not job or job["version"] != self.version or job["state"] in {"applying", "planning"}:
+            await interaction.followup.send("This preview changed. Use the latest card.")
+            return
         if self.action == "approve":
             if job["state"] != "awaiting":
                 return
@@ -135,7 +139,16 @@ class Parent(discord.Client):
         self.db.commit()
         self.wake = asyncio.Event()
         self.worker = None
+        self.active_jobs = {}
+        self.deploy_lock = asyncio.Lock()
+        self.deploy_blocked = False
         self.add_dynamic_items(RequestButton)
+
+    @staticmethod
+    def can_manage(user, job):
+        return user.id == job["author"] or bool(
+            getattr(getattr(user, "guild_permissions", None), "administrator", False)
+        )
 
     def get(self, job_id):
         return self.db.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
@@ -186,6 +199,9 @@ class Parent(discord.Client):
                 await self.worker
             except asyncio.CancelledError:
                 pass
+        for task in self.active_jobs.values():
+            task.cancel()
+        await asyncio.gather(*self.active_jobs.values(), return_exceptions=True)
         await self.changes.http.aclose()
         self.db.close()
         await super().close()
@@ -221,7 +237,7 @@ class Parent(discord.Client):
                 inline=False,
             )
         embed.set_footer(
-            text=f"Revision {job['version']} · requester approval required · one deployment at a time"
+            text=f"Revision {job['version']} · requester or administrator approval required"
         )
         kwargs = {"embed": embed, "view": view}
         if attach and job["proposal"]:
@@ -252,7 +268,7 @@ class Parent(discord.Client):
         if (
             not self.allowed(interaction.channel)
             or not job
-            or interaction.user.id != job["author"]
+            or not self.can_manage(interaction.user, job)
         ):
             return
         if job["version"] != version or job["state"] == "applying":
@@ -288,7 +304,7 @@ class Parent(discord.Client):
             "SELECT * FROM jobs WHERE thread=? ORDER BY id DESC LIMIT 1",
             (message.channel.id,),
         ).fetchone()
-        if job and job["author"] == message.author.id and job["state"] != "applying":
+        if job and self.can_manage(message.author, job) and job["state"] != "applying":
             self.update(
                 job["id"],
                 request=job["request"] + "\n\nFollow-up\n" + prompt,
@@ -395,117 +411,140 @@ class Parent(discord.Client):
             self.db.execute("UPDATE jobs SET state='queued' WHERE state='planning'")
         while not self.is_closed():
             self.wake.clear()
-            job = self.db.execute(
-                "SELECT * FROM jobs WHERE state IN ('approved','queued') ORDER BY id LIMIT 1"
-            ).fetchone()
-            if not job:
-                await self.wake.wait()
-                continue
-            job_id, version = job["id"], job["version"]
-            try:
-                if job["state"] == "approved":
-                    proposal = json.loads(job["proposal"])
-                    if self.changes.digest(
-                        self.changes.snapshot()
-                    ) != self.changes.digest(proposal["base"]):
-                        self.update(
-                            job_id,
-                            state="queued",
-                            version=version + 1,
-                            note="Child changed. Preparing a fresh approval preview.",
-                        )
-                        await self.card(job_id)
-                        continue
-                    self.update(
-                        job_id,
-                        state="applying",
-                        note="Approved change is being applied. Checking restart health.",
+            for job in self.db.execute(
+                "SELECT * FROM jobs WHERE state IN ('approved','queued') ORDER BY id"
+            ).fetchall():
+                if job["id"] not in self.active_jobs and not (
+                    self.deploy_blocked and job["state"] == "approved"
+                ):
+                    task = asyncio.create_task(self.process_job(job["id"]))
+                    self.active_jobs[job["id"]] = task
+                    task.add_done_callback(
+                        lambda _, job_id=job["id"]: self.job_finished(job_id)
                     )
-                    await self.card(job_id)
-                    try:
-                        self.changes.install(proposal)
-                        await self.changes.restart()
-                    except StaleProposal:
-                        self.update(
-                            job_id,
-                            state="queued",
-                            version=version + 1,
-                            note="Source changed. Preparing a new preview.",
-                        )
-                        await self.card(job_id)
-                        continue
-                    except Exception:
-                        try:
-                            self.changes.restore(proposal)
-                            await self.changes.restart()
-                        except Exception:
-                            self.update(
-                                job_id,
-                                note="Rollback needs operator attention. Deployment queue stopped.",
-                            )
-                            await self.card(job_id)
-                            logging.exception("Rollback failed")
-                            return
-                        raise RuntimeError(
-                            "Deployment failed. Previous source and settings were restored."
-                        )
-                    self.update(
-                        job_id,
-                        state="done",
-                        note="Applied. Together AI reconnected successfully. Use Edit request or @mention me in the thread to refine it.",
-                    )
-                else:
-                    self.update(
-                        job_id,
-                        state="planning",
-                        note="Reading the current implementation and running protecting-your-energy.",
-                    )
-                    await self.card(job_id)
-                    proposal = await self.changes.propose(job["request"], job_id)
+            await self.wake.wait()
+
+    def job_finished(self, job_id):
+        self.active_jobs.pop(job_id, None)
+        self.wake.set()
+
+    async def process_job(self, job_id):
+        job = self.get(job_id)
+        if not job or job["state"] not in {"queued", "approved"}:
+            return
+        version = job["version"]
+        try:
+            if job["state"] == "approved":
+                async with self.deploy_lock:
+                    job = self.get(job_id)
                     if (
-                        self.get(job_id)["version"] != version
-                        or self.get(job_id)["state"] != "planning"
+                        self.deploy_blocked
+                        or job["state"] != "approved"
+                        or job["version"] != version
                     ):
-                        continue
-                    plan = proposal["plan"]
-                    if plan["questions"]:
-                        note = "\n".join(str(q) for q in plan["questions"])
-                        state = "clarify"
-                    elif not self.changes.diff(proposal).strip():
-                        note, state = (
-                            plan["summary"] + "\nNo implementation change is needed.",
-                            "done",
-                        )
-                    else:
-                        note, state = (
-                            plan["summary"]
-                            + "\n\nAre you sure? Review the attached diff, then approve or edit.",
-                            "awaiting",
-                        )
-                    self.update(
-                        job_id, state=state, proposal=json.dumps(proposal), note=note
-                    )
-                    thread = self.get_channel(
-                        job["thread"]
-                    ) or await self.fetch_channel(job["thread"])
-                    if thread.archived:
-                        await thread.edit(archived=False)
-                    await thread.send(note[:1900])
-                await self.card(job_id, attach=True)
-            except Exception as exc:
-                logging.exception("Request failed")
-                if self.get(job_id)["version"] == version:
-                    self.update(
-                        job_id,
-                        state="failed",
-                        note=str(exc)[:950]
-                        if isinstance(exc, (ValueError, RuntimeError))
-                        else "The department hit an error. Retry planning or refine the request.",
-                    )
-                    try:
-                        await self.card(job_id)
-                    except Exception:
-                        logging.exception("Could not update request card")
+                        return
+                    await self.deploy(job_id, version, job)
+                return
+            self.update(
+                job_id,
+                state="planning",
+                note="Reading the current implementation and running protecting-your-energy.",
+            )
+            await self.card(job_id)
+            proposal = await self.changes.propose(job["request"], job_id)
+            if (
+                self.get(job_id)["version"] != version
+                or self.get(job_id)["state"] != "planning"
+            ):
+                return
+            plan = proposal["plan"]
+            if plan["questions"]:
+                note = "\n".join(str(q) for q in plan["questions"])
+                state = "clarify"
+            elif not self.changes.diff(proposal).strip():
+                note, state = (
+                    plan["summary"] + "\nNo implementation change is needed.",
+                    "done",
+                )
+            else:
+                note, state = (
+                    plan["summary"]
+                    + "\n\nAre you sure? Review the attached diff, then approve or edit.",
+                    "awaiting",
+                )
+            self.update(job_id, state=state, proposal=json.dumps(proposal), note=note)
+            thread = self.get_channel(job["thread"]) or await self.fetch_channel(
+                job["thread"]
+            )
+            if thread.archived:
+                await thread.edit(archived=False)
+            await thread.send(note[:1900])
+            await self.card(job_id, attach=True)
+        except Exception as exc:
+            logging.exception("Request failed")
+            if self.get(job_id)["version"] == version:
+                self.update(
+                    job_id,
+                    state="failed",
+                    note=str(exc)[:950]
+                    if isinstance(exc, (ValueError, RuntimeError))
+                    else "The department hit an error. Retry planning or refine the request.",
+                )
+                await self.card(job_id)
+
+    async def deploy(self, job_id, version, job):
+        proposal = json.loads(job["proposal"])
+        if self.changes.digest(self.changes.snapshot()) != self.changes.digest(
+            proposal["base"]
+        ):
+            self.update(
+                job_id,
+                state="queued",
+                version=version + 1,
+                note="Child changed. Preparing a fresh approval preview.",
+            )
+            await self.card(job_id)
+            return
+        self.update(
+            job_id,
+            state="applying",
+            note="Approved change is being applied. Checking restart health.",
+        )
+        await self.card(job_id)
+        try:
+            self.changes.install(proposal)
+            await self.changes.restart()
+        except StaleProposal:
+            self.update(
+                job_id,
+                state="queued",
+                version=version + 1,
+                note="Source changed. Preparing a new preview.",
+            )
+            await self.card(job_id)
+            return
+        except Exception:
+            try:
+                self.changes.restore(proposal)
+                await self.changes.restart()
+            except Exception:
+                self.update(
+                    job_id,
+                    note="Rollback needs operator attention. Deployment queue stopped.",
+                )
+                await self.card(job_id)
+                self.deploy_blocked = True
+                logging.exception("Rollback failed")
+                return
+            raise RuntimeError(
+                "Deployment failed. Previous source and settings were restored."
+            )
+        self.update(
+            job_id,
+            state="done",
+            note="Applied. Together AI reconnected successfully. Use Edit request or @mention me in the thread to refine it.",
+        )
+        await self.card(job_id, attach=True)
 
 
 def main():

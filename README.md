@@ -94,9 +94,9 @@ The bot runs on this computer. Its availability depends on this computer and the
 
 ## Skill Issue Department
 
-The separate parent bot accepts explicit @mentions in the management channel `1571760182248218634` and its threads. Mention it with a Together AI change request. It creates a discussion thread and maintains a public status card with Edit request, approval and cancellation buttons. Thread follow-ups also require an @mention. Only the requester can approve or edit their proposal.
+The separate parent bot accepts explicit @mentions in the management channel `1571760182248218634` and its threads. Mention it with a Together AI change request. It creates a discussion thread and maintains a public status card with Edit request, approval and cancellation buttons. Thread follow-ups also require an @mention. The requester and server administrators can approve, edit, cancel and refine a proposal.
 
-The parent runs the installed protecting-your-energy `UserPromptSubmit` hook before each model planning call, reads the current child implementation, asks necessary clarifying questions, and attaches a proposed diff. Confirmation queues the exact reviewed change. Source changes since review require a fresh proposal and approval. Requests are planned and deployed sequentially. Waiting for one person's clarification does not block other ready requests.
+The parent runs the installed protecting-your-energy `UserPromptSubmit` hook before each model planning call, reads the current child implementation, asks necessary clarifying questions, and attaches a proposed diff. Confirmation queues the exact reviewed change. Source changes since review require a fresh proposal and approval. Requests are planned concurrently. Approved deployments are coordinated so changes cannot overwrite each other, and a stale preview requires renewed approval.
 
 The parent can edit Together AI's Python modules, persona and model/participation settings. Its own runtime, credentials, dependencies, service configuration and conversation database are outside the generated patch interface. Deployment restarts Together AI and checks its Discord-ready log. Failure restores the previous files and settings. Interrupted deployments are recovered on parent startup. Request revisions and before-change snapshots persist in a separate private SQLite database.
 
