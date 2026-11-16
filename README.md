@@ -12,13 +12,13 @@ Both Discord identities expose `/status`, `/cleanup` and `/projects`. Status inc
 
 The permission button opens Discord’s authorization page with the bot selected for this server. Discord must grant Manage Messages and Manage Threads before full cleanup can run. Channel overrides and inaccessible private history appear in the review. The bot cannot grant itself permissions. Thread-starter and membership system entries disappear when their thread is deleted.
 
-Project organization uses the installed Thought Reconstruction skill, its evidence contract and Protect Your Energy’s sustain-momentum guidance. Source paths and hashes are retained with the inferred groups. The classifier recovers purpose, relationships, corrections and uncertainty from current server activity. It uses `auto/fast`, considers bounded recent context and project candidates, and requires attributed human evidence. Message edits and deletions invalidate affected evidence. Historical archive data remains in the separate predictor workflow. Project groups and source links appear in `/projects` and the dashboard.
+Project organization uses the installed Thought Reconstruction skill, its evidence contract and Protect Your Energy’s sustain-momentum guidance. Source paths and hashes are retained with the inferred groups. The classifier recovers purpose, relationships, corrections and uncertainty from current server activity. It uses `auto/best-free`, considers bounded recent context and project candidates, and requires attributed human evidence. Message edits and deletions invalidate affected evidence. Historical archive data remains in the separate predictor workflow. Project groups and source links appear in `/projects` and the dashboard.
 
-Default-titled chat threads receive a coherent name from `auto/fast` after their first meaningful prompt. New maintenance threads use the same naming route with their issue number retained. Explicit user-supplied titles take precedence. Failed inference leaves an explicit naming failure in activity records. These features require the installed Thought Reconstruction and Protect Your Energy guidance on the bot host.
+Default-titled chat threads receive a coherent name from `auto/best-free` after their first meaningful prompt. New maintenance threads use the same naming route with their issue number retained. Explicit user-supplied titles take precedence. Provider outages and invalid model titles retry automatically; configuration issues remain visible as requests for user input. Dry-run instances never rename threads or update their stored titles. These features require the installed Thought Reconstruction and Protect Your Energy guidance on the bot host.
 
 ## Prediction and review
 
-Reply Guy defaults to dry-run with the `auto/fast` route. Skill Issue Department uses `auto/best-free`. It posts a labelled proposed follow-up with Helpful, Missed, Edit and Review controls. Votes, edited drafts and reviews persist and inform later predictions. A subsequent message from the configured owner is compared with the original prediction by intent and constraints. A semantic score of at least 0.8 marks an estimated match. The predictor configuration can override this with `semantic_threshold`. Lexical fallback is labelled separately and establishes equivalence only for normalized exact text. These are uncalibrated estimates, and human reviews remain visible alongside them.
+Reply Guy defaults to dry-run with the `auto/best-free` route. Skill Issue Department uses `auto/best-free`. It posts a labelled proposed follow-up with Helpful, Missed, Edit and Review controls. Votes, edited drafts and reviews persist and inform later predictions. A subsequent message from the configured owner is compared with the original prediction by intent and constraints. A semantic score of at least 0.8 marks an estimated match. The predictor configuration can override this with `semantic_threshold`. Lexical fallback is labelled separately and establishes equivalence only for normalized exact text. These are uncalibrated estimates, and human reviews remain visible alongside them.
 
 The local archive index currently contains 22,470 deduplicated assistant/owner follow-up pairs. The private coverage record identifies reviewed collections and omissions, including three oversized Codex records. This is archive-informed retrieval with feedback, and exact imitation of a person is unverified. A bounded review of 46 pairs across 44 conversations supplies 11 contextual behavior/style guidelines, with aggregate style measurements across the index. Raw historical conversations stay local. The gateway receives inferred guidance, recent Discord feedback and current scoped Discord messages.
 
@@ -43,7 +43,8 @@ Mention the bot or reply to one of its messages. Everyone sees the response. Eac
 | `/chat message` | Ask the current model, optionally selecting a model or skill |
 | `/new title` | Start a dedicated shared conversation thread |
 | `/thread with_user` or `/convo with_user` | Start or adopt a conversation thread, add friends and ping them there |
-| `/retry model` | Retry the latest answer, optionally through another route |
+| `/retry model` | Resume pending work without discarding connector checkpoints, or regenerate a completed answer |
+| `/reconcile result` | After checking an uncertain connector call, record its observed result and resume without executing it again |
 | `/history` | Export the conversation messages currently included in the AI context |
 | `/participation` | Select Off, Quiet, Balanced or Lively and adjust the pause and cooldown |
 | `/video prompt model` | Generate a video through a connected gateway route |
@@ -81,7 +82,7 @@ Run commands from this directory, or invoke the `together-ai` script by absolute
 ```bash
 ./together-ai status
 ./together-ai models claude
-./together-ai route auto/fast
+./together-ai route auto/best-free
 ./together-ai route auto/claude-sonnet --channel CHANNEL_ID
 ./together-ai alias claude auto/claude-sonnet
 ./together-ai gateway https://omniroute-edge.bodecloud.workers.dev --key-file /absolute/private/ai-key
@@ -137,3 +138,9 @@ Use Edit request on a completed card or @mention the parent in its thread to ref
 The maintenance preset runs within `bot-hub.service` using its private configuration. Together AI ignores the management channel and its threads so the maintenance preset owns that conversation. Both Discord identities run on this host.
 
 The parent defaults to `auto/best-free`. Planning uses staged edits and a finish tool, detects repeated inspection calls, and asks for a final proposal when inspection repeats.
+
+Ordinary chat, predictor, project organization and thread naming use the shared free inference router. Its default is `auto/best-free`. The primary gateway is preferred; explicitly configured free outage endpoints are used when it is unavailable. Provider outages wait and retry automatically with the request and connector results preserved. Activity records retain canonical route IDs and provider-reported model provenance. Existing saved routes and historical records are not migrated by this code change.
+
+Chat requests are checkpointed in the existing conversation database and resume after restart. Source edits, deletion and reset cancel obsolete work. Pending turns appear as queued, recovering, waiting or delivering in the dashboard; configuration problems and uncertain connector acceptance are labelled as needing user input. Completed answers retain their Retry and Edit prompt controls. Discord delivery interrupted after possible acceptance is reconciled using the answer's persistent controls before another send. If that cannot be established, the request needs user review. Image and video generation keep their dedicated routes and are never automatically replayed after uncertain acceptance. Public-channel chat reloads earlier screenshots only when the new prompt refers to image context; attached images and conversation-thread image context remain available to vision routes.
+
+Chat requests are saved before source lookup. Execution freezes the input history at that prompt, including completed preceding answers and excluding later queued prompts. Restart recovery retains connector checkpoints and reconciles interrupted Discord delivery before sending again. Source edits and deletions remain durable until their output cleanup finishes; thread edits apply the same rewind during live handling and restart recovery. Changed attachment sources require input review rather than combining new bytes with old connector results. Ordinary resource failures recover automatically. Uncertain connector acceptance waits for the prompt author to check the connector and use `/reconcile result`; `/retry` never erases that uncertainty. Dedicated image/video generation is never automatically replayed after an uncertain response.

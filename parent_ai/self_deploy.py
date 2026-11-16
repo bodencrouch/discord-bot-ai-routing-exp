@@ -429,6 +429,15 @@ def _current(record):
 
 def _finish(path, record, phase, note):
     """Commit the job and its receipt atomically, preserving concurrent edits."""
+    if (
+        phase in {"failed", "launch_failed"}
+        and record.get("install_started")
+        and not record.get("rollback_verified")
+    ):
+        phase = "blocked"
+        note = "Rollback needs operator attention. Deployment queue stopped."
+    elif phase in {"failed", "launch_failed"}:
+        note += " The reviewed change will retry automatically; edit or cancel remains available."
     if phase == "blocked":
         shared = _register(path, record)
         _atomic(
@@ -461,23 +470,54 @@ def _finish(path, record, phase, note):
                 # Keep the transaction recoverable until its source is rolled back.
                 raise OwnershipChanged("Deployment ownership changed before completion")
             if previous:
-                state = (
-                    "applying"
-                    if phase == "blocked"
-                    else (
-                        "queued"
-                        if phase == "stale"
-                        else ("done" if phase == "done" else "failed")
-                    )
-                )
-                new_version = record["version"] + (phase == "stale")
+                states = {
+                    "blocked": "attention",
+                    "stale": "queued",
+                    "done": "done",
+                    "cancelled": "cancelled",
+                    "failed": "waiting",
+                    "launch_failed": "waiting",
+                }
+                state = states[phase]
+                retry = phase in {"failed", "launch_failed"}
+                # A completed rollback owns a new handoff identity, retaining the
+                # exact approved proposal. The old transaction stays terminal.
+                new_version = record["version"] + (phase == "stale" or retry)
+                columns = {
+                    row[1] for row in database.execute("PRAGMA table_info(jobs)")
+                }
+                for name, definition in {
+                    "next_retry": "REAL DEFAULT 0",
+                    "recovery_target": "TEXT DEFAULT 'queued'",
+                    "card_delivery_pending": "INTEGER DEFAULT 0",
+                    "card_delivery_retry": "REAL DEFAULT 0",
+                    "card_delivery_attempts": "INTEGER DEFAULT 0",
+                    "card_generation": "INTEGER DEFAULT 0",
+                    "card_retired": "INTEGER DEFAULT 0",
+                }.items():
+                    if name not in columns:
+                        database.execute(
+                            f"ALTER TABLE jobs ADD COLUMN {name} {definition}"
+                        )
                 database.execute(
                     "INSERT INTO audit(job,snapshot) VALUES(?,?)",
                     (record["job_id"], json.dumps(dict(previous))),
                 )
                 database.execute(
-                    "UPDATE jobs SET state=?,version=?,note=? WHERE id=? AND version=? AND state='applying'",
-                    (state, new_version, note, record["job_id"], record["version"]),
+                    "UPDATE jobs SET state=?,version=?,note=?,next_retry=?,recovery_target=?,"
+                    "card_delivery_pending=CASE WHEN card_retired=1 THEN 0 ELSE 1 END,"
+                    "card_delivery_retry=0,card_delivery_attempts=0,"
+                    "card_generation=COALESCE(card_generation,0)+1 "
+                    "WHERE id=? AND version=? AND state='applying'",
+                    (
+                        state,
+                        new_version,
+                        note,
+                        time.time() + 15 if retry else 0,
+                        "approved" if retry else "queued",
+                        record["job_id"],
+                        record["version"],
+                    ),
                 )
             elif not previous and phase != "blocked":
                 phase = "cancelled"
@@ -780,6 +820,7 @@ def _run(path):
                     "Rollback needs operator attention. Deployment queue stopped.",
                 )
                 return
+            record["rollback_verified"] = True
             _finish(
                 path,
                 record,

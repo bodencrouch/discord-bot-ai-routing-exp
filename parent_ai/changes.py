@@ -5,15 +5,18 @@ import hashlib
 import json
 import math
 import os
-import random
 import re
-import shlex
-import time
-from email.utils import parsedate_to_datetime
 import sys
+import time
 from pathlib import Path
 
 import httpx
+
+from together_ai.inference import (
+    FreeInferenceRouter,
+    InferenceConfigurationError,
+    normalize_chat_response,
+)
 
 CONTEXT_HASH_VERSION = 2
 
@@ -24,6 +27,7 @@ PRIVATE_FIELDS = {
     "database",
     "dashboard_login_file",
     "planning_endpoint",
+    "free_inference_endpoints",
 }
 CONFIG_FIELDS = {
     "default_model",
@@ -38,174 +42,6 @@ CONFIG_FIELDS = {
     "guild_id",
     "persona_file",
 }
-
-
-def normalize_chat_response(response):
-    """Assemble a buffered OpenAI-compatible SSE response into ordinary JSON."""
-    is_stream = "text/event-stream" in response.headers.get("content-type", "").lower()
-    if not response.is_success or not (
-        is_stream or response.content.lstrip().startswith(b"data:")
-    ):
-        return response
-    choices, metadata = {}, {}
-    done = False
-
-    def interrupted(reason):
-        try:
-            request = response.request
-        except RuntimeError:
-            request = None
-        diagnostics = {
-            "model": metadata.get("model"),
-            "finish_reasons": [
-                choice.get("finish_reason") for choice in choices.values()
-            ],
-            "usage": metadata.get("usage"),
-            "visible_chars": sum(
-                len(choice["message"].get("content") or "")
-                for choice in choices.values()
-            ),
-            "tool_argument_chars": sum(
-                len(tool["function"]["arguments"])
-                for choice in choices.values()
-                for tool in choice.get("tools", {}).values()
-            ),
-            "done": done,
-        }
-        usage = diagnostics["usage"] or {}
-        counts = {
-            key: usage[key]
-            for key in ("prompt_tokens", "completion_tokens", "total_tokens")
-            if isinstance(usage, dict) and key in usage
-        }
-        detail = {
-            "model": diagnostics["model"],
-            "finish_reasons": diagnostics["finish_reasons"],
-            "tokens": counts,
-            "visible_chars": diagnostics["visible_chars"],
-            "tool_argument_chars": diagnostics["tool_argument_chars"],
-        }
-        error = httpx.ReadError(
-            "Incomplete planning stream: "
-            + reason
-            + ". Diagnostics "
-            + json.dumps(detail),
-            request=request,
-        )
-        error.completion_diagnostics = diagnostics
-        return error
-
-    for event in response.text.replace("\r\n", "\n").replace("\r", "\n").split("\n\n"):
-        data = "\n".join(
-            line[5:].lstrip(" ")
-            for line in event.split("\n")
-            if line.startswith("data:")
-        )
-        if not data:
-            continue
-        if any(
-            line.startswith("event:") and line[6:].strip() == "error"
-            for line in event.split("\n")
-        ):
-            raise interrupted("the provider emitted an error event")
-        if data.strip() == "[DONE]":
-            done = True
-            break
-        try:
-            chunk = json.loads(data)
-        except (ValueError, TypeError) as error:
-            raise interrupted("invalid SSE event JSON") from error
-        if (
-            not isinstance(chunk, dict)
-            or chunk.get("error")
-            or chunk.get("type") == "error"
-        ):
-            raise interrupted("the provider emitted an error event")
-        if chunk.get("model") == "keepalive":
-            continue
-        for key in ("id", "model", "created", "system_fingerprint", "usage"):
-            if chunk.get(key) is not None:
-                metadata[key] = chunk[key]
-        for item in chunk.get("choices", []):
-            index = item.get("index", 0)
-            choice = choices.setdefault(
-                index,
-                {
-                    "index": index,
-                    "message": {"role": "assistant", "content": ""},
-                    "finish_reason": None,
-                    "tools": {},
-                },
-            )
-            delta = item.get("delta") or item.get("message") or {}
-            if delta.get("role"):
-                choice["message"]["role"] = delta["role"]
-            content = delta.get("content")
-            if isinstance(content, str):
-                choice["message"]["content"] += content
-            elif isinstance(content, list):
-                choice["message"]["content"] += "".join(
-                    part.get("text", "")
-                    for part in content
-                    if isinstance(part, dict) and isinstance(part.get("text"), str)
-                )
-            for fragment in delta.get("tool_calls") or []:
-                tool = choice["tools"].setdefault(
-                    fragment.get("index", 0),
-                    {
-                        "id": "",
-                        "type": "function",
-                        "function": {"name": "", "arguments": ""},
-                    },
-                )
-                if fragment.get("id"):
-                    tool["id"] += fragment["id"]
-                function = fragment.get("function") or {}
-                if function.get("name"):
-                    tool["function"]["name"] += function["name"]
-                arguments = function.get("arguments")
-                if arguments is not None:
-                    tool["function"]["arguments"] += (
-                        arguments
-                        if isinstance(arguments, str)
-                        else json.dumps(arguments)
-                    )
-            if item.get("finish_reason") is not None:
-                choice["finish_reason"] = item["finish_reason"]
-    if not done:
-        raise interrupted("the connection ended before [DONE]")
-    if not choices:
-        raise interrupted("the provider returned no completion choices")
-    assembled = []
-    for index in sorted(choices):
-        choice = choices[index]
-        if choice["finish_reason"] == "length":
-            raise interrupted("the completion hit its output length limit")
-        if choice["finish_reason"] in {None, "content_filter"}:
-            raise interrupted("the completion did not finish or was filtered")
-        tools = choice.pop("tools")
-        if tools:
-            choice["message"]["tool_calls"] = [tools[key] for key in sorted(tools)]
-            if not choice["message"]["content"]:
-                choice["message"]["content"] = None
-        assembled.append(choice)
-    payload = dict(metadata, object="chat.completion", choices=assembled)
-    headers = {
-        key: value
-        for key, value in response.headers.items()
-        if key.lower() not in {"content-type", "content-length", "content-encoding"}
-    }
-    try:
-        request = response.request
-    except RuntimeError:
-        request = None
-    return httpx.Response(
-        response.status_code,
-        json=payload,
-        headers=headers,
-        request=request,
-        extensions=response.extensions,
-    )
 
 
 class PlanningHTTPClient(httpx.AsyncClient):
@@ -383,6 +219,13 @@ class PlanningHTTPClient(httpx.AsyncClient):
                 await asyncio.gather(heartbeat, return_exceptions=True)
 
 
+class PlanningLifecycleError(RuntimeError):
+    """Failure outside inference recovery; the job owner can persist and resume it."""
+
+    category = "planning_lifecycle"
+    retryable = True
+
+
 class StaleProposal(ValueError):
     pass
 
@@ -411,13 +254,21 @@ class Changes:
         for key in ("PARENT_CONFIG", "BOT_HUB_CONFIG"):
             if os.environ.get(key):
                 self.private_paths.add((self.root / os.environ[key]).resolve())
-        endpoint = config.get("planning_endpoint") or {}
-        if isinstance(endpoint, dict) and endpoint.get("credential_env_file"):
-            self.private_paths.add(
-                (
-                    self.root / Path(endpoint["credential_env_file"]).expanduser()
-                ).resolve()
-            )
+        for values in settings:
+            endpoints = list(values.get("free_inference_endpoints") or [])
+            endpoints.append(values.get("planning_endpoint") or {})
+            for endpoint in endpoints:
+                if not isinstance(endpoint, dict):
+                    continue
+                for field in (
+                    "credential_env_file",
+                    "credential_json_file",
+                    "api_key_file",
+                ):
+                    if endpoint.get(field):
+                        self.private_paths.add(
+                            (self.root / Path(endpoint[field]).expanduser()).resolve()
+                        )
         self.planning_first_output_timeout = PlanningHTTPClient.positive_timeout(
             config.get("planning_first_output_timeout"), 90
         )
@@ -427,89 +278,18 @@ class Changes:
         self.planning_request_lock = asyncio.Lock()
         self.planning_next_request = 0.0
         self.http = PlanningHTTPClient(timeout=240)
+        self.inference = None
 
     def planning_transport(self, gateway):
-        endpoint = self.config.get("planning_endpoint")
-        if not endpoint:
-            return {
-                "base_url": gateway["base_url"].rstrip("/"),
-                "headers": {
-                    "Authorization": "Bearer "
-                    + Path(gateway["api_key_file"]).read_text().strip()
-                },
-                "transport_model": None,
-                "protocol": None,
-                "max_tokens": 24000,
-                "supports_response_format": True,
-                "min_interval_seconds": 0.0,
-            }
-        if not isinstance(endpoint, dict):
-            raise ValueError("planning_endpoint must be an object.")
-        url = httpx.URL(endpoint.get("base_url", ""))
-        if (
-            url.scheme != "https"
-            or not url.host
-            or url.userinfo
-            or url.query
-            or url.fragment
-        ):
-            raise ValueError(
-                "Planning endpoint must be an HTTPS base URL without credentials or query."
-            )
-        model = endpoint.get("transport_model")
-        protocol = endpoint.get("protocol", "json_actions")
-        max_tokens = endpoint.get("max_tokens", 4096)
-        if not isinstance(model, str) or not model.strip():
-            raise ValueError("Planning endpoint needs a transport_model.")
-        if protocol not in {"json_actions", "native"}:
-            raise ValueError("Unknown planning endpoint protocol.")
-        if type(max_tokens) is not int or not 1 <= max_tokens <= 24000:
-            raise ValueError(
-                "Planning endpoint max_tokens must be an integer from 1 to 24000."
-            )
-        env_name = endpoint.get("credential_env_name")
-        if not isinstance(env_name, str) or not re.fullmatch(
-            r"[A-Za-z_][A-Za-z0-9_]*", env_name
-        ):
-            raise ValueError("Planning endpoint needs a valid credential_env_name.")
-        key = None
-        env_file = endpoint.get("credential_env_file")
-        if not isinstance(env_file, str) or not env_file.strip():
-            raise ValueError("Planning endpoint needs a credential_env_file reference.")
-        env_path = self.root / Path(env_file).expanduser()
-        for line in env_path.read_text().splitlines():
-            line = line.strip()
-            if line.startswith("export "):
-                line = line[7:].lstrip()
-            name, separator, value = line.partition("=")
-            if separator and name.strip() == env_name:
-                parts = shlex.split(value, comments=True, posix=True)
-                if len(parts) == 1:
-                    key = parts[0]
-        if not key:
-            raise ValueError(
-                "Planning endpoint credential is unavailable in its configured env file."
-            )
-        supports_format = endpoint.get("supports_response_format", False)
-        if type(supports_format) is not bool:
-            raise ValueError("supports_response_format must be a boolean.")
-        interval = endpoint.get("min_interval_seconds", 0)
-        if (
-            type(interval) not in {int, float}
-            or not math.isfinite(interval)
-            or interval < 0
-        ):
-            raise ValueError(
-                "min_interval_seconds must be a finite nonnegative number."
-            )
+        """Keep the legacy transport descriptor while the router owns failover."""
         return {
-            "base_url": str(url).rstrip("/"),
-            "headers": {"Authorization": "Bearer " + key},
-            "transport_model": model,
-            "protocol": protocol,
-            "max_tokens": max_tokens,
-            "supports_response_format": supports_format,
-            "min_interval_seconds": float(interval),
+            "base_url": gateway["base_url"].rstrip("/"),
+            "headers": {},
+            "transport_model": None,
+            "protocol": "json_actions",
+            "max_tokens": 24000,
+            "supports_response_format": True,
+            "min_interval_seconds": 0.0,
         }
 
     def snapshot(self):
@@ -810,6 +590,23 @@ class Changes:
     async def propose(
         self, request, job_id, progress=None, context=None, resume=None, checkpoint=None
     ):
+        try:
+            return await self._propose(
+                request, job_id, progress, context, resume, checkpoint
+            )
+        except (InferenceConfigurationError, PlanningLifecycleError):
+            raise
+        except Exception as error:
+            # Cancellation inherits BaseException and deliberately passes through.
+            raise PlanningLifecycleError(
+                "Planning needs lifecycle recovery ("
+                + type(error).__name__
+                + "); resume the preserved checkpoint after the underlying issue is repaired."
+            ) from error
+
+    async def _propose(
+        self, request, job_id, progress=None, context=None, resume=None, checkpoint=None
+    ):
         async def emit(message):
             if progress:
                 await progress(message)
@@ -836,6 +633,8 @@ Use the most recent follow-up as the user's current intent. Be concise and light
 """
         c = json.loads((self.root / "config.json").read_text())
         transport = self.planning_transport(c)
+        if self.inference is None:
+            self.inference = FreeInferenceRouter(c | self.config, self.http)
 
         def tool(name, description, properties, required):
             return {
@@ -916,6 +715,8 @@ Use the most recent follow-up as the user's current intent. Be concise and light
         json_protocol = False
         use_json_format = True
         configured_route = self.config.get("model", "auto/best-free")
+        if configured_route == "auto/fast":
+            configured_route = "auto/best-free"
         route = configured_route
         fallback = self.config.get("planning_fallback_model")
         route_trace = [{"model": route, "reason": "configured planning route"}]
@@ -962,50 +763,19 @@ Use the most recent follow-up as the user's current intent. Be concise and light
                         ),
                     }
 
-        def next_route():
-            if fallback != "auto/fast":
-                return None
-            candidate = configured_route if route == fallback else fallback
-            return (
-                candidate
-                if candidate != route and candidate not in attempted_routes
-                else None
-            )
-
-        async def use_fallback(reason):
-            nonlocal route, invalid_proposals, json_protocol, use_json_format
-            candidate = next_route()
-            if candidate is None:
-                return False
-            route = candidate
-            attempted_routes.add(route)
-            invalid_proposals = 0
-            use_json_format = transport["supports_response_format"]
-            if transport["protocol"] == "json_actions" or route == configured_route:
-                activate_json_protocol()
-            else:
-                json_protocol = False
-            route_trace.append(
-                {
-                    "model": route,
-                    "reason": reason,
-                    "transport_base_url": transport["base_url"],
-                    "transport_model": transport["transport_model"] or route,
-                }
-            )
-            await emit(
-                f"The configured route could not complete this planning operation ({reason}). Using authorized fallback {route} for this operation. The configured planning default is {configured_route}."
-            )
-            messages.append({"role": "user", "content": protocol_help})
-            await save_checkpoint()
-            return True
-
         def decode_calls(values):
             if not isinstance(values, list):
                 raise ValueError("tool_calls must be an array")
             decoded = []
             for index, value in enumerate(values):
+                if not isinstance(value, dict):
+                    raise TypeError("Each tool call must be an object")
                 function = value.get("function", value)
+                if not isinstance(function, dict):
+                    raise TypeError("Tool function must be an object")
+                call_id = value.get("id")
+                if call_id is not None and not isinstance(call_id, str):
+                    raise TypeError("Tool call id must be a string")
                 name = function.get("name", function.get("action"))
                 if name not in {item["function"]["name"] for item in tools}:
                     raise ValueError("Use an available tool name")
@@ -1016,12 +786,44 @@ Use the most recent follow-up as the user's current intent. Be concise and light
                     raise ValueError("Tool arguments must be a JSON object")
                 decoded.append(
                     {
-                        "id": value.get("id") or f"action-{turn}-{index}",
+                        "id": call_id or f"action-{turn}-{index}",
                         "type": "function",
                         "function": {"name": name, "arguments": arguments},
                     }
                 )
             return decoded
+
+        def validate_arguments(name, args):
+            schema = next(
+                item["function"]["parameters"]
+                for item in tools
+                if item["function"]["name"] == name
+            )
+            if not isinstance(args, dict):
+                raise TypeError(
+                    "Tool arguments must be an object matching the supplied tool schema"
+                )
+            missing = set(schema["required"]) - args.keys()
+            extra = args.keys() - schema["properties"].keys()
+            if missing or extra:
+                raise ValueError(
+                    f"Invalid {name} arguments: missing {sorted(missing)}, unexpected {sorted(extra)}"
+                )
+            types = {"string": str, "integer": int, "object": dict, "array": list}
+            for key, value in args.items():
+                rule = schema["properties"][key]
+                if type(value) is not types[rule["type"]]:
+                    raise TypeError(f"{name}.{key} must be {rule['type']}")
+                if rule["type"] == "integer" and not rule.get(
+                    "minimum", value
+                ) <= value <= rule.get("maximum", value):
+                    raise ValueError(
+                        f"{name}.{key} is outside the supplied schema bounds"
+                    )
+                if rule["type"] == "array" and any(
+                    not isinstance(item, str) for item in value
+                ):
+                    raise ValueError(f"{name}.{key} must contain strings")
 
         messages = [
             {
@@ -1030,7 +832,6 @@ Use the most recent follow-up as the user's current intent. Be concise and light
             },
             {"role": "user", "content": self.planning_content(request, base, context)},
         ]
-        headers = transport["headers"]
         turn = 0
         request_hash = hashlib.sha256(str(request).encode()).hexdigest()
         context_hash = self.context_digest(context)
@@ -1083,9 +884,13 @@ Use the most recent follow-up as the user's current intent. Be concise and light
                             raise ValueError(
                                 "legacy checkpoint cannot validate supplied context or images"
                             )
+                # The router re-authorizes every candidate. Migrating the old
+                # auto/fast default must not discard an otherwise valid draft.
                 if resume.get("route") not in {
-                    self.config.get("model", "auto/best-free"),
+                    configured_route,
                     fallback,
+                    "auto/fast",
+                    "auto/best-free",
                 }:
                     raise ValueError("the checkpoint route is no longer authorized")
                 saved_messages = resume["messages"]
@@ -1164,23 +969,12 @@ Use the most recent follow-up as the user's current intent. Be concise and light
                     "The prior checkpoint does not match the current source, request, or supplied context/images. Starting a fresh plan from the current snapshot."
                 )
 
-        if transport["transport_model"]:
-            route_trace.append(
-                {
-                    "model": route,
-                    "reason": "authorized planner transport override",
-                    "transport_base_url": transport["base_url"],
-                    "transport_model": transport["transport_model"],
-                }
-            )
-            await emit(
-                f"Planner transport override: logical route {route}, endpoint {transport['base_url']}, "
-                f"transport model {transport['transport_model']}."
-            )
-            use_json_format = transport["supports_response_format"]
-            if transport["protocol"] == "json_actions":
-                activate_json_protocol()
-                messages.append({"role": "user", "content": protocol_help})
+        # Explicit JSON actions allow text transports to plan without losing tool
+        # results. Images remain in the original user content and are never stripped.
+        activate_json_protocol()
+        use_json_format = True
+        messages.append({"role": "user", "content": protocol_help})
+        route = configured_route
 
         async def save_checkpoint():
             if not checkpoint:
@@ -1222,101 +1016,36 @@ Use the most recent follow-up as the user's current intent. Be concise and light
                 }
             )
 
-        attempted_routes = {route}
-
         async def request_with_retries(body):
-            handoff_available = next_route() is not None
-            for attempt in range(3):
-                response = None
-                try:
-                    if transport["min_interval_seconds"]:
-                        while True:
-                            async with self.planning_request_lock:
-                                now = time.monotonic()
-                                delay = self.planning_next_request - now
-                                if delay <= 0:
-                                    self.planning_next_request = (
-                                        now + transport["min_interval_seconds"]
-                                    )
-                                    break
-                            await asyncio.sleep(delay)
-                    response = await self.http.post(
-                        transport["base_url"] + "/chat/completions",
-                        headers=headers,
-                        json=body,
-                        planning_progress=emit,
-                        planning_first_output_timeout=self.planning_first_output_timeout,
-                        planning_turn_timeout=self.planning_turn_timeout,
-                    )
-                    response = normalize_chat_response(response)
-                except httpx.TransportError as error:
-                    if handoff_available and isinstance(error, httpx.ReadTimeout):
-                        raise
-                    if attempt == 2:
-                        raise
-                    if str(error).startswith(
-                        "Incomplete planning stream: the completion hit its output length limit"
-                    ):
-                        messages.append(
-                            {
-                                "role": "user",
-                                "content": (
-                                    "The last streamed output exceeded its output limit and was discarded. "
-                                    "Preserve all existing staged edits. Continue with a small batch of focused stage_edit calls, "
-                                    "using short, exact, unique old_text fragments and their replacement new_text. "
-                                    "Avoid repeating full source files or large old/new bodies. Inspect limited relevant line ranges "
-                                    "if needed. Use finish_change after the remaining edits are staged, rather than serializing "
-                                    "the entire files map. Return complete small tool calls that fit the existing output budget."
-                                ),
-                            }
-                        )
-                        await emit(
-                            "The response reached its output limit. Retrying with smaller incremental edits and the current staged draft."
-                        )
-                        await save_checkpoint()
-                    failure = type(error).__name__
-                    if str(error).startswith("Incomplete planning stream:"):
-                        failure += ": " + str(error)
-                else:
-                    if handoff_available and response.status_code in {429, 524}:
-                        return response
-                    if (
-                        response.status_code not in {408, 429}
-                        and not 500 <= response.status_code <= 599
-                    ):
-                        return response
-                    if attempt == 2:
-                        return response
-                    failure = f"HTTP {response.status_code}"
-                delay = float(attempt + 1)
-                retry_after = (
-                    response.headers.get("Retry-After")
-                    if response is not None
-                    else None
+            response = await self.inference.post(body, progress=emit)
+            provenance = response.extensions.get("inference_route")
+            if provenance and (
+                not route_trace or route_trace[-1].get("provenance") != provenance
+            ):
+                route_trace.append(
+                    {
+                        "model": provenance["canonical_model"],
+                        "reason": "validated response",
+                        "provenance": provenance,
+                    }
                 )
-                if retry_after:
-                    try:
-                        delay = max(delay, float(retry_after))
-                    except ValueError:
-                        try:
-                            delay = max(
-                                delay,
-                                parsedate_to_datetime(retry_after).timestamp()
-                                - time.time(),
-                            )
-                        except (ValueError, TypeError, OverflowError):
-                            pass
-                delay = min(300.0, max(0.0, delay) + random.uniform(0, 0.25))
-                await emit(
-                    f"Transient planning failure on {route} ({failure}, attempt {attempt + 1}/3). Retrying the same request in {delay:.1f}s; the planning checkpoint is preserved."
-                )
-                await asyncio.sleep(delay)
+            return response
 
         attempt_turns = 0
-        while attempt_turns < max_turns:
+        while True:
+            if attempt_turns >= max_turns:
+                attempt_turns = 0
+                force_final = False
+                seen_calls.clear()
+                await save_checkpoint()
+                await emit(
+                    f"Planning epoch completed after {max_turns} actions; preserving {len(staged)} staged file(s) and continuing automatically."
+                )
+                await asyncio.sleep(self.inference.retry_seconds)
             attempt_turns += 1
             turn += 1
             await emit(f"Model turn {turn}: requesting the next action from {route}.")
+            activate_json_protocol()
             body = {
                 "model": transport["transport_model"] or route,
                 "max_tokens": transport["max_tokens"],
@@ -1331,67 +1060,7 @@ Use the most recent follow-up as the user's current intent. Be concise and light
             else:
                 body.update(tools=tools, tool_choice="none" if force_final else "auto")
             await save_checkpoint()
-            try:
-                response = await request_with_retries(body)
-            except httpx.TransportError as error:
-                reason = (
-                    "the route hit a read timeout"
-                    if isinstance(error, httpx.ReadTimeout)
-                    else "transport failures persisted after three same-route attempts"
-                )
-                if await use_fallback(reason):
-                    continue
-                raise RuntimeError(
-                    f"Planning route {route} failed after three transport attempts. Retry can resume the preserved planning checkpoint."
-                ) from error
-            if not response.is_success:
-                if (
-                    response.status_code in {408, 429}
-                    or 500 <= response.status_code <= 599
-                ):
-                    reason = (
-                        f"the route returned HTTP {response.status_code}"
-                        if response.status_code in {429, 524}
-                        else f"HTTP {response.status_code} persisted after three same-route attempts"
-                    )
-                    if await use_fallback(reason):
-                        continue
-                    raise RuntimeError(
-                        f"Planning route {route} returned HTTP {response.status_code} after three attempts. Retry can resume the preserved planning checkpoint."
-                    )
-                provider_error = response.text.lower()
-                if response.status_code in {400, 422}:
-                    if (
-                        "image" in provider_error
-                        or "vision" in provider_error
-                        or "multimodal" in provider_error
-                    ):
-                        if await use_fallback("the route rejected image input"):
-                            continue
-                        raise RuntimeError(
-                            f"Planning route {route} rejected the supplied image input. Configure a vision-capable planning fallback."
-                        )
-                    if not json_protocol and (
-                        "tool" in provider_error or "function" in provider_error
-                    ):
-                        activate_json_protocol()
-                        messages.append({"role": "user", "content": protocol_help})
-                        await emit(
-                            f"{route} rejected native tool calling. Retrying the same route with explicit JSON actions."
-                        )
-                        continue
-                    if (
-                        json_protocol
-                        and use_json_format
-                        and "response_format" in provider_error
-                    ):
-                        use_json_format = False
-                        continue
-                    if await use_fallback("the planning protocol was rejected"):
-                        continue
-                raise RuntimeError(
-                    f"Planning route {route} returned HTTP {response.status_code}."
-                )
+            response = await request_with_retries(body)
             message = response.json()["choices"][0]["message"]
             content = message.get("content") or ""
             native_calls = bool(message.get("tool_calls"))
@@ -1451,14 +1120,7 @@ Use the most recent follow-up as the user's current intent. Be concise and light
                 IndexError,
             ) as exc:
                 invalid_proposals += 1
-                if invalid_proposals >= 3:
-                    if await use_fallback(
-                        "same-route structured-action recovery failed"
-                    ):
-                        continue
-                    raise RuntimeError(
-                        f"Planning route {route} did not produce usable tool actions or a valid proposal after structured recovery. No changes were applied."
-                    ) from exc
+                self.inference.reject_last_response("invalid planning action")
                 activate_json_protocol()
                 messages.append(
                     {
@@ -1468,8 +1130,16 @@ Use the most recent follow-up as the user's current intent. Be concise and light
                     }
                 )
                 await emit(
-                    f"The route did not return a usable planning action ({exc}). Retrying with an explicit JSON schema and available tools."
+                    f"The route did not return a usable planning action ({exc}). Rotating free candidates with the staged draft preserved."
                 )
+                await save_checkpoint()
+                if invalid_proposals % 3 == 0:
+                    await asyncio.sleep(
+                        min(
+                            self.inference.max_backoff,
+                            self.inference.retry_seconds * min(invalid_proposals, 30),
+                        )
+                    )
                 continue
             invalid_proposals = 0
             if native_calls:
@@ -1486,13 +1156,9 @@ Use the most recent follow-up as the user's current intent. Be concise and light
                 name = call["function"]["name"]
                 raw = call["function"].get("arguments", "{}")
                 await emit(f"Tool call **{name}**\n```json\n{raw}\n```")
-                tool_succeeded = False
                 try:
                     args = json.loads(raw)
-                    if not isinstance(args, dict):
-                        raise ValueError(
-                            "Tool arguments must be an object matching the supplied tool schema."
-                        )
+                    validate_arguments(name, args)
                     fingerprint = name + json.dumps(args, sort_keys=True)
                     if name == "read_file":
                         current_text = staged.get(
@@ -1611,7 +1277,6 @@ Use the most recent follow-up as the user's current intent. Be concise and light
                     else:
                         raise ValueError("Unknown tool.")
                     output = json.dumps(result, ensure_ascii=False)
-                    tool_succeeded = True
                 except (
                     ValueError,
                     KeyError,
@@ -1619,6 +1284,9 @@ Use the most recent follow-up as the user's current intent. Be concise and light
                     SyntaxError,
                     json.JSONDecodeError,
                 ) as exc:
+                    self.inference.reject_last_response(
+                        "invalid tool arguments or result"
+                    )
                     output = json.dumps({"error": str(exc)})
                 await emit(f"Tool result **{name}**\n```json\n{output}\n```")
                 if native_calls:
@@ -1635,13 +1303,11 @@ Use the most recent follow-up as the user's current intent. Be concise and light
                             + "\nReturn the next JSON action or the complete proposal.",
                         }
                     )
-                if tool_succeeded:
-                    await save_checkpoint()
-        raise RuntimeError(
-            f"Planning reached its {max_turns}-turn action budget on {route}. No changes were applied."
-        )
+                await save_checkpoint()
 
     def validate(self, plan):
+        if not isinstance(plan, dict):
+            raise TypeError("proposal must be an object")
         if not isinstance(plan.get("summary"), str) or not isinstance(
             plan.get("questions"), list
         ):
@@ -1650,6 +1316,8 @@ Use the most recent follow-up as the user's current intent. Be concise and light
             plan.get("config"), dict
         ):
             raise ValueError("The model did not return a complete change set.")
+        if any(not isinstance(question, str) for question in plan["questions"]):
+            raise ValueError("Proposal questions must contain strings.")
         if plan["questions"] and (plan["files"] or plan["config"]):
             raise ValueError(
                 "Clarifications must be resolved before proposing changes."

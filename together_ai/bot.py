@@ -24,6 +24,7 @@ In public channels, mention me or use `/chat`. In managed AI conversation thread
 Use **Retry** or **Edit prompt** beneath an answer. Editing your original Discord message also regenerates it.
 Editing an earlier thread prompt rewinds the thread, removes later messages, and regenerates from there.
 `/history` shows this conversation's AI context. `/retry` retries the latest answer.
+`/reconcile result` records the connector result you checked when acceptance is uncertain, then resumes the saved request.
 `/participation` adjusts how often I join in. Mentions and direct replies still get an answer.
 `/models` finds available routes. `/model` selects this channel's route.
 `/routes` lists favorites and manages route aliases.
@@ -65,10 +66,12 @@ async def attachment_image_parts(message, budget):
             )
         try:
             data = await attachment.read()
-        except discord.HTTPException:
-            raise ValueError(
-                "Discord could not load an attached image. Reattach it and retry."
-            ) from None
+        except discord.HTTPException as error:
+            if error.status == 404:
+                raise ValueError(
+                    "The attached image is no longer available. Reattach it and retry."
+                ) from None
+            raise
         if len(data) > 8 * 1024 * 1024 or len(data) > budget["bytes"]:
             raise ValueError(
                 "Each image must fit 8 MiB, with at most 16 MiB of images per request."
@@ -166,6 +169,10 @@ class Together(discord.Client):
         self.slots = asyncio.Semaphore(4)
         self.room_locks = {}
         self.room_epochs = {}
+        self.active_turns = {}
+        self.recovery_tasks = set()
+        self.recovery_scan_running = False
+        self.recovery_loop_task = None
         self.internal_deletes = set()
         self.ambient_tasks = {}
         self.ambient_sequences = {}
@@ -199,8 +206,18 @@ class Together(discord.Client):
                 type=discord.ActivityType.listening, name="/help · mention me to chat"
             )
         )
+        await self.recover_pending_turns()
+        if self.recovery_loop_task is None or self.recovery_loop_task.done():
+            self.recovery_loop_task = asyncio.create_task(self._recover_waiting_turns())
 
     async def close(self):
+        pending = set(self.active_turns.values()) | self.recovery_tasks
+        if self.recovery_loop_task:
+            pending.add(self.recovery_loop_task)
+        pending.discard(asyncio.current_task())
+        for task in pending:
+            task.cancel()
+        await asyncio.gather(*pending, return_exceptions=True)
         for task in self.ambient_tasks.values():
             task.cancel()
         await self.engine.http.aclose()
@@ -216,7 +233,13 @@ class Together(discord.Client):
         turn = self.store.turn(key)
         if turn:
             version = turn["version"] if version is None else version
-            view.add_item(TurnButton(key, "retry", version))
+            if version > turn["version"] or turn["status"] not in {
+                "pending",
+                "recovering",
+                "waiting",
+                "delivering",
+            }:
+                view.add_item(TurnButton(key, "retry", version))
             view.add_item(TurnButton(key, "edit", version))
         view.add_item(RawJSONButton(key, expanded))
         return view
@@ -287,6 +310,32 @@ class Together(discord.Client):
             )
             for message_id in message_ids:
                 self.invalidate_image_cache(message_id)
+                draft_task = getattr(self, "draft_sources", {}).get(str(message_id))
+                if draft_task and (
+                    event != "raw_message_edit"
+                    or "content" in payload.data
+                    or "attachments" in payload.data
+                ):
+                    draft_task.cancel()
+                turn = self.store.turn_by_source(message_id)
+                changed = event != "raw_message_edit"
+                if turn and event == "raw_message_edit":
+                    content = payload.data.get("content")
+                    changed = "attachments" in payload.data or (
+                        content is not None
+                        and self.normalize_prompt(
+                            content,
+                            getattr(
+                                self.get_channel(payload.channel_id), "guild", None
+                            ),
+                        )
+                        != turn["prompt"]
+                    )
+                if turn and changed:
+                    if event == "raw_message_edit":
+                        self.queue_source_refresh(turn["key"], data=payload.data)
+                    else:
+                        self.queue_turn_operation(turn["key"], "delete")
         super().dispatch(event, *args, **kwargs)
 
     async def source_image_parts(
@@ -321,7 +370,16 @@ class Together(discord.Client):
         budget["bytes"] -= cached["bytes"]
         return cached["parts"]
 
-    async def image_history(self, channel, history, budget):
+    async def image_history(
+        self,
+        channel,
+        history,
+        budget,
+        *,
+        prompt="",
+        include_previous=True,
+        snapshots=None,
+    ):
         """Reload recent source images without persisting image bytes in SQLite."""
         context = []
         candidates = []
@@ -331,15 +389,53 @@ class Together(discord.Client):
             context.append(entry)
             if source_id and entry.get("role") == "user":
                 candidates.append((entry, source_id))
+        refers_to_image = bool(
+            re.search(
+                r"\b(image|screenshot|picture|photo|diagram|attachment|shown|above|look at|see this)\b",
+                prompt,
+                re.I,
+            )
+        )
+        if not include_previous and not refers_to_image:
+            return context
         for entry, source_id in reversed(candidates):
             try:
-                parts = await self.source_image_parts(channel, source_id, budget)
+                if snapshots is not None:
+                    if (
+                        snapshots.get(str(source_id), {}).get("source_attachments")
+                        == []
+                    ):
+                        # Frozen text needs no Discord lookup once we know this
+                        # history entry supplied no attachment bytes.
+                        continue
+                    source = await channel.fetch_message(int(source_id))
+                    snapshot = self.source_snapshot(source)
+                    if (
+                        str(source_id) in snapshots
+                        and snapshots[str(source_id)] != snapshot
+                    ):
+                        raise ValueError(
+                            "Earlier image source changed; review the saved input before continuing."
+                        )
+                    snapshots[str(source_id)] = snapshot
+                    parts = await self.source_image_parts(
+                        channel, source_id, budget, source=source, refresh=True
+                    )
+                else:
+                    parts = await self.source_image_parts(channel, source_id, budget)
             except (
                 discord.HTTPException,
                 ValueError,
                 OSError,
                 asyncio.TimeoutError,
             ) as error:
+                if snapshots is not None:
+                    # Never combine completed connector results with substituted input.
+                    if isinstance(error, discord.NotFound):
+                        raise ValueError(
+                            "An earlier image source is no longer available. Review the saved input before continuing."
+                        ) from error
+                    raise
                 content = entry.get("content", "")
                 detail = (
                     ("Discord HTTP " + str(error.status))
@@ -366,6 +462,701 @@ class Together(discord.Client):
                 ) + parts
         return context
 
+    def bot_role_ids(self, guild):
+        return {
+            role.id
+            for role in getattr(getattr(guild, "me", None), "roles", ())
+            if getattr(role, "managed", False)
+            and getattr(getattr(role, "tags", None), "bot_id", None) == self.user.id
+        }
+
+    def mentioned_directly(self, message):
+        return self.user in message.mentions or bool(
+            self.bot_role_ids(message.guild)
+            & {int(value) for value in re.findall(r"<@&(\d+)>", message.content)}
+        )
+
+    def normalize_prompt(self, content, guild=None):
+        prompt = re.sub(rf"<@!?{self.user.id}>", "", content)
+        roles = self.bot_role_ids(guild)
+        return re.sub(
+            r"<@&(\d+)>",
+            lambda match: "" if int(match[1]) in roles else match[0],
+            prompt,
+        ).strip()
+
+    def normalized_source_prompt(self, source):
+        prompt = self.normalize_prompt(
+            source.content,
+            getattr(source, "guild", getattr(source.channel, "guild", None)),
+        )
+        return prompt or (
+            "Describe the attached image." if has_image_attachment(source) else ""
+        )
+
+    def source_snapshot(self, source):
+        return {
+            "source_prompt": self.normalized_source_prompt(source),
+            "source_edited_at": source.edited_at.isoformat()
+            if source.edited_at
+            else None,
+            "source_attachments": [
+                [
+                    str(getattr(item, "id", "")),
+                    item.filename,
+                    getattr(item, "size", None),
+                ]
+                for item in source.attachments
+            ],
+        }
+
+    def source_changed(self, turn, request, source):
+        snapshot = self.source_snapshot(source)
+        prior_prompt = self.normalize_prompt(
+            request.get("source_prompt", turn["prompt"]), source.channel.guild
+        )
+        if (
+            not prior_prompt
+            and snapshot["source_prompt"] == "Describe the attached image."
+        ):
+            prior_prompt = snapshot["source_prompt"]
+        return prior_prompt != snapshot["source_prompt"] or (
+            "source_attachments" in request
+            and request["source_attachments"] != snapshot["source_attachments"]
+        )
+
+    def queue_turn_operation(self, key, kind, **changes):
+        turn = self.store.turn(key)
+        if not turn:
+            return
+        previous = json.loads(turn.get("operation_json") or "{}")
+        if (
+            kind == "refresh"
+            and previous.get("kind") == "refresh"
+            and previous.get("native_snapshot") == changes.get("native_snapshot")
+        ):
+            return
+        # A source deletion cannot be undone by a delayed edit callback.
+        if previous.get("kind") == "delete":
+            kind, changes = "delete", {}
+        operation = {
+            "id": uuid.uuid4().hex,
+            "kind": kind,
+            "resume_status": previous.get("resume_status", turn["status"]),
+            "resume_detail": previous.get("resume_detail", turn.get("recovery_detail")),
+            "origin_snapshot": previous.get("native_snapshot")
+            or {
+                name: value
+                for name, value in json.loads(turn.get("request_json") or "{}").items()
+                if name in {"source_prompt", "source_attachments", "source_edited_at"}
+            },
+            **changes,
+        }
+        self.store.checkpoint_turn(
+            key,
+            status="deleting" if kind == "delete" else "revising",
+            operation=operation,
+            detail="Reconciling deleted source."
+            if kind == "delete"
+            else "Reconciling revised source before replacing its answer.",
+        )
+        self.cancel_turn(key)
+        # An older edit must be able to acquire the room lock even when a later
+        # request is waiting on a provider. Its checkpoint remains intact.
+        for later_key in list(self.active_turns):
+            later = self.store.turn(later_key)
+            if later and later["room"] == turn["room"] and later["seq"] > turn["seq"]:
+                self.cancel_turn(later_key)
+
+    def queue_source_refresh(self, key, *, data=None, source=None):
+        """Persist distinct source input; duplicate raw/cached events keep its ID."""
+        turn = self.store.turn(key)
+        if not turn:
+            return False
+        operation = json.loads(turn.get("operation_json") or "{}")
+        if operation.get("kind") == "delete":
+            return False
+        request = json.loads(turn.get("request_json") or "{}")
+        baseline = dict(
+            operation.get("native_snapshot")
+            or operation.get("origin_snapshot")
+            or request
+        )
+        baseline.setdefault("source_prompt", turn["prompt"])
+        channel = self.get_channel(int(turn["room"]))
+        guild = getattr(channel, "guild", None)
+        baseline["source_prompt"] = self.normalize_prompt(
+            baseline["source_prompt"], guild
+        )
+        if source is not None:
+            snapshot = self.source_snapshot(source)
+        else:
+            snapshot = {
+                name: value
+                for name, value in baseline.items()
+                if name.startswith("source_")
+            }
+            data = data or {}
+            if "content" in data:
+                if data["content"] == operation.get("bot_edit_content"):
+                    return False
+                snapshot["source_prompt"] = self.normalize_prompt(
+                    data["content"], guild
+                )
+            if "attachments" in data:
+                known = {
+                    item[0]: item for item in baseline.get("source_attachments", [])
+                }
+                snapshot["source_attachments"] = [
+                    [
+                        str(item.get("id", "")),
+                        item.get(
+                            "filename",
+                            known.get(str(item.get("id", "")), ["", "", None])[1],
+                        ),
+                        item.get(
+                            "size",
+                            known.get(str(item.get("id", "")), ["", "", None])[2],
+                        ),
+                    ]
+                    for item in data["attachments"]
+                ]
+            if not snapshot["source_prompt"] and any(
+                Path(item[1]).suffix.lower()
+                in {".png", ".jpg", ".jpeg", ".gif", ".webp"}
+                for item in snapshot.get("source_attachments", [])
+            ):
+                snapshot["source_prompt"] = "Describe the attached image."
+        if (
+            not baseline["source_prompt"]
+            and snapshot["source_prompt"] == "Describe the attached image."
+        ):
+            baseline["source_prompt"] = snapshot["source_prompt"]
+        if baseline["source_prompt"] == snapshot["source_prompt"] and (
+            "source_attachments" not in baseline
+            or "source_attachments" not in snapshot
+            or baseline["source_attachments"] == snapshot["source_attachments"]
+        ):
+            return False
+        self.queue_turn_operation(key, "refresh", native_snapshot=snapshot)
+        return True
+
+    def cancel_turn(self, key, status=None):
+        task = self.active_turns.get(key)
+        if status:
+            self.store.checkpoint_turn(key, status=status)
+        if task and task is not asyncio.current_task():
+            task.cancel()
+
+    def cancel_room_turns(self, room):
+        for turn in self.store.pending_turns():
+            if turn["room"] == str(room):
+                self.cancel_turn(turn["key"], "reset")
+
+    def turn_event(self, kind, payload):
+        emit = getattr(self, "emit", None)
+        if emit:
+            emit(kind, payload)
+
+    async def _recover_waiting_turns(self):
+        while not self.is_closed():
+            await asyncio.sleep(5)
+            await self.recover_pending_turns()
+
+    async def recover_pending_turns(self):
+        if self.recovery_scan_running or getattr(self, "instance", {}).get("dry_run"):
+            return
+        self.recovery_scan_running = True
+        try:
+            for turn in self.store.pending_turns():
+                if turn["key"] in self.active_turns:
+                    continue
+                task = asyncio.create_task(self._resume_turn(turn["key"]))
+                self.recovery_tasks.add(task)
+                self.active_turns[turn["key"]] = task
+                task.add_done_callback(self.recovery_tasks.discard)
+        finally:
+            self.recovery_scan_running = False
+
+    async def _apply_turn_operation(self, channel, turn, source):
+        key = turn["key"]
+        operation = json.loads(turn.get("operation_json") or "{}")
+        if not operation:
+            return True
+        request = json.loads(turn.get("request_json") or "{}")
+        checkpoint = json.loads(turn.get("checkpoint_json") or "{}")
+        source_snapshot = self.source_snapshot(source) if source else None
+        deleting = operation["kind"] == "delete"
+        if (
+            operation["kind"] == "refresh"
+            and source
+            and not self.source_changed(turn, request, source)
+        ):
+            # Discord also emits unchanged content/attachment updates. Compare the
+            # fetched source before any output reconciliation, deletion or rewind.
+            request.update(self.source_snapshot(source), source_initialized=True)
+            status = operation.get("resume_status")
+            if status not in {
+                "complete",
+                "pending",
+                "recovering",
+                "waiting",
+                "waiting_user",
+                "delivering",
+                "response_deleted",
+            }:
+                status = (
+                    "waiting_user"
+                    if checkpoint.get("tool_in_flight")
+                    else (
+                        "delivering"
+                        if checkpoint.get("answer")
+                        else "complete"
+                        if turn["version"]
+                        else "recovering"
+                    )
+                )
+            with self.store.db:
+                self.store.db.execute(
+                    "UPDATE turns SET operation_json=NULL,status=?,recovery_detail=?,request_json=? WHERE key=?",
+                    (status, operation.get("resume_detail"), json.dumps(request), key),
+                )
+            return True
+        if checkpoint.get("tool_in_flight"):
+            raise ValueError(
+                "Connector acceptance is uncertain. Use /reconcile with its checked result before applying the saved source change."
+            )
+        outputs = await self._delivery_outputs(channel, turn)
+        if not deleting and isinstance(channel, discord.Thread):
+            anchor = turn["source_id"] or turn.get("anchor_id")
+            if not anchor:
+                raise ValueError("A thread rewind requires a reliable message anchor.")
+            outputs = [
+                message
+                async for message in channel.history(
+                    limit=None, after=discord.Object(id=int(anchor))
+                )
+            ]
+        await self.delete_messages(channel, outputs, preserve_turn_key=key)
+        # A newer source event can arrive while Discord cleanup is in progress.
+        current = self.store.turn(key)
+        if (
+            not current
+            or json.loads(current.get("operation_json") or "{}").get("id")
+            != operation["id"]
+        ):
+            return False
+        if deleting:
+            self.store.remove_message(turn["source_id"])
+            return False
+        if source and self.source_changed(turn, source_snapshot, source):
+            self.queue_source_refresh(key, source=source)
+            return False
+        revised = operation.get("prompt")
+        if revised is None:
+            revised = (
+                source_snapshot["source_prompt"]
+                if source and not source.author.bot
+                else turn["prompt"]
+            )
+        if source:
+            request.update(source_snapshot, source_initialized=True)
+            if source.author.id == self.user.id and operation.get("prompt") is not None:
+                operation["bot_edit_content"] = (
+                    f"**{turn['author_name']}**\n{revised[:1800]}"
+                )
+                self.store.checkpoint_turn(key, operation=operation)
+                edited = await source.edit(content=operation["bot_edit_content"])
+                request.update(self.source_snapshot(edited or source))
+                current = self.store.turn(key)
+                if (
+                    not current
+                    or json.loads(current.get("operation_json") or "{}").get("id")
+                    != operation["id"]
+                ):
+                    return False
+        request.pop("execution_history", None)
+        request.pop("history_image_snapshots", None)
+        request["prompt_annotation"] = (
+            revised if operation.get("prompt") is not None else None
+        )
+        if isinstance(channel, discord.Thread):
+            for later in self.store.db.execute(
+                "SELECT key FROM turns WHERE room=? AND seq>?",
+                (turn["room"], turn["seq"]),
+            ).fetchall():
+                self.cancel_turn(later["key"], "superseded")
+        self.store.rewind(
+            key,
+            revised,
+            truncate=isinstance(channel, discord.Thread),
+            request=request,
+            model=operation.get("model"),
+        )
+        return True
+
+    async def _resume_turn(self, key, channel=None, send=None):
+        turn = self.store.turn(key)
+        if not turn:
+            return
+        room = turn["room"]
+        self.active_turns[key] = asyncio.current_task()
+        tracked = getattr(self, "turn_tasks", None)
+        if tracked is not None:
+            tracked.add(asyncio.current_task())
+        try:
+            channel = (
+                channel
+                or self.get_channel(int(room))
+                or await self.fetch_channel(int(room))
+            )
+            if hasattr(self, "allowed") and not self.allowed(channel):
+                return
+            if getattr(self, "cleanup_running", lambda: False)():
+                return
+            async with self.room_locks.setdefault(room, asyncio.Lock()):
+                turn = self.store.turn(key)
+                if not turn or turn["status"] not in {
+                    "pending",
+                    "recovering",
+                    "waiting",
+                    "delivering",
+                    "revising",
+                    "deleting",
+                }:
+                    return
+                earlier_operation = self.store.db.execute(
+                    "SELECT key FROM turns WHERE room=? AND seq<? AND operation_json IS NOT NULL AND status!='reset' ORDER BY seq LIMIT 1",
+                    (room, turn["seq"]),
+                ).fetchone()
+                if earlier_operation:
+                    self.store.checkpoint_turn(
+                        key,
+                        detail="Waiting for an earlier source change to be reconciled.",
+                    )
+                    return
+                source = None
+                request = json.loads(turn.get("request_json") or "{}")
+                operation = json.loads(turn.get("operation_json") or "{}")
+                if turn["source_id"] and operation.get("kind") != "delete":
+                    try:
+                        source = await channel.fetch_message(int(turn["source_id"]))
+                    except discord.NotFound:
+                        self.queue_turn_operation(key, "delete")
+                    else:
+                        snapshot = self.source_snapshot(source)
+                        initialized = request.get(
+                            "source_initialized", "source_prompt" in request
+                        )
+                        changed = initialized and self.source_changed(
+                            turn, request, source
+                        )
+                        if initialized and (changed or operation):
+                            self.queue_source_refresh(key, source=source)
+                        elif not initialized:
+                            if not source.author.bot:
+                                with self.store.db:
+                                    self.store.db.execute(
+                                        "UPDATE turns SET prompt=? WHERE key=?",
+                                        (snapshot["source_prompt"], key),
+                                    )
+                            request.update(snapshot, source_initialized=True)
+                            self.store.checkpoint_turn(key, request=request)
+                turn = self.store.turn(key)
+                if not await self._apply_turn_operation(channel, turn, source):
+                    return
+                current = self.store.turn(key)
+                if not current or current["status"] not in {
+                    "pending",
+                    "recovering",
+                    "waiting",
+                    "delivering",
+                }:
+                    return current
+                return await self._complete_pending_turn(
+                    key, channel, send or channel.send, source=source
+                )
+        except asyncio.CancelledError:
+            raise
+        except ValueError as error:
+            self.store.checkpoint_turn(
+                key, status="waiting_user", detail=safe_error(error)
+            )
+            self.turn_event(
+                "turn.waiting_user",
+                {"turn_key": key, "channel_id": room, "detail": safe_error(error)},
+            )
+        except Exception as error:
+            current = self.store.turn(key)
+            if current:
+                # Delivery and source operations are phases, not transient errors.
+                phase = (
+                    current["status"]
+                    if current["status"] in {"delivering", "revising", "deleting"}
+                    else "waiting"
+                )
+                self.store.checkpoint_turn(
+                    key,
+                    status=phase,
+                    detail="Discord recovery unavailable: " + type(error).__name__,
+                )
+            self.turn_event(
+                "turn.waiting",
+                {"turn_key": key, "channel_id": room, "reason": type(error).__name__},
+            )
+        finally:
+            if self.active_turns.get(key) is asyncio.current_task():
+                self.active_turns.pop(key, None)
+            if tracked is not None:
+                tracked.discard(asyncio.current_task())
+        return self.store.turn(key)
+
+    async def _delivery_outputs(self, channel, turn):
+        outputs = []
+        for output_id in json.loads(turn["output_ids"]):
+            try:
+                outputs.append(await channel.fetch_message(int(output_id)))
+            except discord.NotFound:
+                pass
+        if outputs or not json.loads(turn.get("checkpoint_json") or "{}").get("answer"):
+            return outputs
+        anchor = turn["source_id"] or turn.get("anchor_id")
+        if not anchor:
+            raise ValueError(
+                "Discord delivery is uncertain; review the conversation before retrying."
+            )
+        count = 0
+        async for message in channel.history(
+            limit=101, after=discord.Object(id=int(anchor))
+        ):
+            count += 1
+            if message.author.id == self.user.id and any(
+                (getattr(component, "custom_id", "") or "").startswith(
+                    f"turn:{turn['key']}:"
+                )
+                for row in getattr(message, "components", [])
+                for component in row.children
+            ):
+                return [message]
+        if count > 100:
+            raise ValueError(
+                "Discord delivery is uncertain; review the conversation before retrying."
+            )
+        return []
+
+    async def _complete_pending_turn(
+        self, key, channel, send, *, source=None, prompt_annotation=None
+    ):
+        turn = self.store.turn(key)
+        if not turn:
+            return None
+        room = turn["room"]
+        request = json.loads(turn.get("request_json") or "{}")
+        prompt_annotation = prompt_annotation or request.get("prompt_annotation")
+        ambient = request.get("ambient", False)
+        epoch = self.room_epochs.get(room, 0)
+        ambient_sequence = self.ambient_sequences.get(room, 0)
+        checkpoint = json.loads(turn.get("checkpoint_json") or "{}")
+        self.active_turns[key] = asyncio.current_task()
+
+        async def progress(detail):
+            current = self.store.turn(key)
+            if (
+                not current
+                or current["status"]
+                in {
+                    "superseded",
+                    "reset",
+                    "response_deleted",
+                }
+                or current.get("operation_json")
+            ):
+                raise asyncio.CancelledError()
+            self.store.checkpoint_turn(key, status="recovering", detail=detail)
+            self.turn_event(
+                "turn.recovering",
+                {"turn_key": key, "channel_id": room, "detail": detail},
+            )
+
+        async def save_checkpoint(data):
+            current = self.store.turn(key)
+            if (
+                not current
+                or current.get("operation_json")
+                or current["status"] == "reset"
+            ):
+                raise asyncio.CancelledError()
+            self.store.checkpoint_turn(key, checkpoint=data)
+
+        try:
+            # A response is checkpointed before delivery. On restart, reconcile a possibly
+            # accepted Discord send by its stable controls before considering another send.
+            if checkpoint.get("answer"):
+                outputs = await self._delivery_outputs(channel, turn)
+                if outputs:
+                    self.store.finish_turn(
+                        key,
+                        turn["prompt"],
+                        checkpoint["selected"],
+                        checkpoint["answer"],
+                        [message.id for message in outputs],
+                        revision=turn["version"] > 0,
+                    )
+                    return self.store.turn(key)
+            if checkpoint.get("answer"):
+                selected, answer, raw = (
+                    checkpoint["selected"],
+                    checkpoint["answer"],
+                    checkpoint["raw"],
+                )
+            else:
+                context = request.get("execution_history", request.get("history"))
+                if context is None:
+                    context = self.store.history(
+                        room,
+                        exclude_source=turn["source_id"],
+                        exclude_turn=key,
+                        with_sources=True,
+                        before_turn=key,
+                    )
+                if "execution_history" not in request:
+                    request["execution_history"] = context
+                    self.store.checkpoint_turn(key, request=request)
+                budget = {"bytes": 16 * 1024 * 1024}
+                if checkpoint.get("tool_in_flight"):
+                    raise ValueError(
+                        "A connector's acceptance is uncertain. Review it before requesting another call."
+                    )
+                images = (
+                    await self.source_image_parts(
+                        channel, turn["source_id"], budget, source=source, refresh=True
+                    )
+                    if turn["source_id"]
+                    else []
+                )
+                context = await self.image_history(
+                    channel,
+                    context,
+                    budget,
+                    prompt=turn["prompt"],
+                    include_previous=bool(images)
+                    or isinstance(channel, discord.Thread),
+                    snapshots=request.setdefault("history_image_snapshots", {}),
+                )
+                self.store.checkpoint_turn(key, request=request)
+                async with channel.typing():
+                    selected, answer, raw = await self.engine.ask(
+                        room,
+                        turn["prompt"],
+                        turn["author_name"],
+                        turn["model"],
+                        turn["skill"],
+                        history=context,
+                        images=images,
+                        persist=False,
+                        casual=not isinstance(channel, discord.Thread),
+                        ambient=ambient,
+                        participation=self.participation(room)["level"],
+                        progress=progress,
+                        checkpoint=save_checkpoint,
+                        resume=checkpoint,
+                    )
+            current = self.store.turn(key)
+            if (
+                not current
+                or current["status"] in {"superseded", "reset", "response_deleted"}
+                or current.get("operation_json")
+                or epoch != self.room_epochs.get(room, 0)
+            ):
+                return None
+            if ambient and (
+                ambient_sequence != self.ambient_sequences.get(room, 0)
+                or answer.strip() == "[SILENT]"
+            ):
+                self.store.discard_pending(key)
+                return None
+            checkpoint = {"selected": selected, "answer": answer, "raw": raw}
+            self.store.checkpoint_turn(
+                key,
+                status="delivering",
+                checkpoint=checkpoint,
+                detail="Delivering the completed answer.",
+            )
+            # Deferred interaction tokens expire during an outage; channel delivery remains valid.
+            if request.get("interaction"):
+                send = channel.send
+            output = await self.render_turn(
+                key,
+                selected,
+                answer,
+                raw,
+                send=send,
+                version=turn["version"] + 1,
+                prompt_annotation=prompt_annotation,
+            )
+            current = self.store.turn(key)
+            if (
+                not current
+                or current.get("operation_json")
+                or current["status"] == "reset"
+            ):
+                return None
+            self.store.finish_turn(
+                key,
+                turn["prompt"],
+                selected,
+                answer,
+                [output.id],
+                revision=turn["version"] > 0,
+            )
+            if ambient:
+                self.last_ambient_reply[room] = time.monotonic()
+            self.turn_event(
+                "turn.resumed", {"turn_key": key, "channel_id": room, "model": selected}
+            )
+        except asyncio.CancelledError:
+            current = self.store.turn(key)
+            if (
+                current
+                and not current.get("operation_json")
+                and current["status"] in {"pending", "recovering", "waiting"}
+            ):
+                self.store.checkpoint_turn(
+                    key,
+                    status="recovering",
+                    detail="Interrupted; will resume after reconnect.",
+                )
+            raise
+        except ValueError as error:
+            self.store.checkpoint_turn(
+                key, status="waiting_user", detail=safe_error(error)
+            )
+            self.turn_event(
+                "turn.waiting_user",
+                {"turn_key": key, "channel_id": room, "detail": safe_error(error)},
+            )
+        except Exception as error:
+            current = self.store.turn(key)
+            if current and current["status"] not in {
+                "delivering",
+                "revising",
+                "deleting",
+            }:
+                self.store.checkpoint_turn(
+                    key,
+                    status="waiting",
+                    detail="Waiting for Discord or request resources: "
+                    + type(error).__name__,
+                )
+            self.turn_event(
+                "turn.waiting",
+                {"turn_key": key, "channel_id": room, "reason": type(error).__name__},
+            )
+        finally:
+            if self.active_turns.get(key) is asyncio.current_task():
+                self.active_turns.pop(key, None)
+        return self.store.turn(key)
+
     async def run_turn(
         self,
         channel,
@@ -380,102 +1171,37 @@ class Together(discord.Client):
         anchor_id=None,
     ):
         room = str(channel.id)
-        async with self.room_locks.setdefault(room, asyncio.Lock()):
-            existing_turn = self.store.turn_by_source(source_id) if source_id else None
-            if existing_turn and existing_turn["room"] == room:
-                return existing_turn
-            source = None
-            if source_id:
-                try:
-                    source = await channel.fetch_message(int(source_id))
-                except discord.NotFound:
-                    return None
-            context = (
-                self.store.history(room, exclude_source=source_id, with_sources=True)
-                if history is None
-                else history
-            )
-            epoch = self.room_epochs.get(room, 0)
-            ambient_sequence = self.ambient_sequences.get(room, 0)
-            selected = self.engine.resolve_model(
-                model or self.store.model(room, self.config["default_model"])
-            )
-            key = uuid.uuid4().hex
-            self.store.begin_turn(
-                key,
-                room,
-                author.id,
-                author.display_name,
-                prompt,
-                selected,
-                skill,
-                source_id,
-                anchor_id,
-            )
-            try:
-                async with self.slots, channel.typing():
-                    budget = {"bytes": 16 * 1024 * 1024}
-                    images = (
-                        await self.source_image_parts(
-                            channel, source.id, budget, source=source, refresh=True
-                        )
-                        if source
-                        else []
-                    )
-                    context = await self.image_history(channel, context, budget)
-                    selected, answer, raw = await self.engine.ask(
-                        room,
-                        prompt,
-                        author.display_name,
-                        selected,
-                        skill,
-                        history=context,
-                        images=images,
-                        persist=False,
-                        casual=not isinstance(channel, discord.Thread),
-                        ambient=ambient,
-                        participation=self.participation(room)["level"],
-                    )
-                changed = epoch != self.room_epochs.get(room, 0)
-                superseded = ambient and ambient_sequence != self.ambient_sequences.get(
-                    room, 0
-                )
-                if changed:
-                    self.store.fail_turn(key)
-                    return None
-                if superseded or (ambient and answer.strip() == "[SILENT]"):
-                    self.store.discard_pending(key)
-                    return None
-                output = await self.render_turn(
-                    key, selected, answer, raw, send=send, version=1
-                )
-                self.store.finish_turn(key, prompt, selected, answer, [output.id])
-                if ambient:
-                    self.last_ambient_reply[room] = time.monotonic()
-            except Exception as error:
-                if ambient:
-                    self.store.discard_pending(key)
-                    logging.warning(
-                        "Ambient participation unavailable (%s)", type(error).__name__
-                    )
-                    return None
-                self.store.fail_turn(key)
-                logging.error("Conversation request failed (%s)", type(error).__name__)
-                text = "I couldn't finish that request. " + safe_error(error)
-                output = await self.render_turn(
-                    key,
-                    selected,
-                    text,
-                    {"error": safe_error(error)},
-                    send=send,
-                    version=0,
-                )
-                with self.store.db:
-                    self.store.db.execute(
-                        "UPDATE turns SET output_ids=? WHERE key=?",
-                        (json.dumps([output.id]), key),
-                    )
-            return self.store.turn(key)
+        existing = self.store.turn_by_source(source_id) if source_id else None
+        if existing and existing["room"] == room:
+            return existing
+        selected = self.engine.resolve_model(
+            model or self.store.model(room, self.config["default_model"])
+        )
+        key = uuid.uuid4().hex
+        # No awaited lookup precedes durable enqueue. Native observe() may already
+        # contain this source, so losing it here would prevent any later retry.
+        boundary = self.store.db.execute(
+            "SELECT COALESCE(MAX(id),0) FROM messages WHERE room=?", (room,)
+        ).fetchone()[0]
+        self.store.begin_turn(
+            key,
+            room,
+            author.id,
+            author.display_name,
+            prompt,
+            selected,
+            skill,
+            source_id,
+            anchor_id,
+            request={
+                "ambient": ambient,
+                "history": history,
+                "history_boundary": boundary,
+                "interaction": bool(anchor_id and not source_id),
+                "source_initialized": False,
+            },
+        )
+        return await self._resume_turn(key, channel, send)
 
     async def create_conversation(
         self, channel, title, author, participants=(), model=None
@@ -517,139 +1243,107 @@ class Together(discord.Client):
         turn = self.store.turn(key)
         if not turn:
             raise ValueError("That conversation turn is no longer available.")
-        room = turn["room"]
-        channel = self.get_channel(int(room)) or await self.fetch_channel(int(room))
-        async with self.room_locks.setdefault(room, asyncio.Lock()):
-            turn = self.store.turn(key)
-            if expected_version is not None and turn["version"] != expected_version:
+        if expected_version is not None and turn["version"] != expected_version:
+            raise ValueError(
+                "That answer has already changed. Use its current controls."
+            )
+        if prompt is not None and str(actor.id) != turn["author_id"]:
+            raise ValueError("Only the prompt author can edit their prompt.")
+        selected = self.engine.resolve_model(model) if model else None
+        if (
+            prompt is None
+            and turn["status"]
+            in {"pending", "recovering", "waiting", "waiting_user", "delivering"}
+            and not turn.get("operation_json")
+        ):
+            checkpoint = json.loads(turn.get("checkpoint_json") or "{}")
+            if checkpoint.get("tool_in_flight"):
                 raise ValueError(
-                    "That answer has already changed. Use its current controls."
+                    "Connector acceptance is uncertain. After reviewing the connector, use /reconcile with its observed result."
                 )
-            if prompt is not None and str(actor.id) != turn["author_id"]:
-                raise ValueError("Only the prompt author can edit their prompt.")
-            revised = turn["prompt"] if prompt is None else prompt
-            if prompt is not None and revised == turn["prompt"]:
-                return channel
-            source_message = None
-            budget = {"bytes": 16 * 1024 * 1024}
-            if turn["source_id"]:
-                source_message = await channel.fetch_message(int(turn["source_id"]))
-            images = (
-                await self.source_image_parts(
-                    channel,
-                    source_message.id,
-                    budget,
-                    source=source_message,
-                    refresh=True,
-                )
-                if source_message
-                else []
-            )
-            output_ids = json.loads(turn["output_ids"])
-            if isinstance(channel, discord.Thread):
-                anchor = (
-                    turn["source_id"]
-                    or turn.get("anchor_id")
-                    or (output_ids[0] if output_ids else None)
-                )
-                if anchor:
-                    targets = [
-                        message
-                        async for message in channel.history(
-                            limit=None, after=discord.Object(id=int(anchor))
-                        )
-                    ]
-                    if not turn["source_id"] and not turn.get("anchor_id"):
-                        try:
-                            targets.append(await channel.fetch_message(int(anchor)))
-                        except discord.NotFound:
-                            pass
-                    await self.delete_messages(channel, targets)
-            else:
-                targets = []
-                for output_id in output_ids:
-                    try:
-                        targets.append(await channel.fetch_message(int(output_id)))
-                    except discord.NotFound:
-                        pass
-                await self.delete_messages(channel, targets)
-            self.store.rewind(
-                key, revised, truncate=isinstance(channel, discord.Thread)
-            )
-            prompt_annotation = revised if prompt is not None else None
-            if prompt is not None and turn["source_id"]:
-                source = await channel.fetch_message(int(turn["source_id"]))
-                if source.author.id == self.user.id:
-                    await source.edit(
-                        content=f"**{turn['author_name']}**\n{revised[:1800]}"
-                    )
-                    prompt_annotation = None
-                elif (
-                    re.sub(rf"<@!?{self.user.id}>", "", source.content).strip()
-                    == revised
-                ):
-                    prompt_annotation = None
-            context = self.store.history(
-                room,
-                exclude_source=turn["source_id"],
-                exclude_turn=key,
-                with_sources=True,
-            )
-            epoch = self.room_epochs.get(room, 0)
-            try:
-                async with self.slots, channel.typing():
-                    context = await self.image_history(channel, context, budget)
-                    selected, answer, raw = await self.engine.ask(
-                        room,
-                        revised,
-                        turn["author_name"],
-                        model or turn["model"],
-                        turn["skill"],
-                        history=context,
-                        images=images,
-                        persist=False,
-                        casual=not isinstance(channel, discord.Thread),
-                    )
-            except Exception as error:
-                if epoch != self.room_epochs.get(room, 0):
-                    return channel
-                self.store.fail_turn(key)
-                failure = "I couldn't regenerate that answer. " + safe_error(error)
-                current_turn = self.store.turn(key)
-                if current_turn is None:
-                    return channel
-                output = await self.render_turn(
-                    key,
-                    model or turn["model"],
-                    failure,
-                    {"error": safe_error(error)},
-                    send=channel.send,
-                    version=current_turn["version"],
-                    prompt_annotation=prompt_annotation,
-                )
+            if selected:
                 with self.store.db:
                     self.store.db.execute(
-                        "UPDATE turns SET answer=?,output_ids=? WHERE key=?",
-                        (failure, json.dumps([output.id]), key),
+                        "UPDATE turns SET model=? WHERE key=?", (selected, key)
                     )
-                return channel
-            if epoch != self.room_epochs.get(room, 0):
-                return channel
-            output = await self.render_turn(
-                key,
-                selected,
-                answer,
-                raw,
-                send=channel.send,
-                version=turn["version"] + 1,
-                prompt_annotation=prompt_annotation,
+            self.store.checkpoint_turn(
+                key, status="delivering" if checkpoint.get("answer") else "recovering"
             )
-            self.store.finish_turn(
-                key, revised, selected, answer, [output.id], revision=True
-            )
-            return channel
+            self.cancel_turn(key)
+            await self._resume_turn(key)
+            return self.get_channel(int(turn["room"]))
+        self.queue_turn_operation(key, "revise", prompt=prompt, model=selected)
+        await self._resume_turn(key)
+        return self.get_channel(int(turn["room"]))
 
-    async def delete_messages(self, channel, targets):
+    async def reconcile_turn(self, key, actor, result):
+        turn = self.store.turn(key)
+        if not turn or str(actor.id) != turn["author_id"]:
+            raise ValueError("Only the prompt author can reconcile this request.")
+        if not result.strip() or len(result) > 20000:
+            raise ValueError(
+                "Include the connector result you checked, under 20,000 characters."
+            )
+        self.cancel_turn(key)
+        async with self.room_locks.setdefault(turn["room"], asyncio.Lock()):
+            turn = self.store.turn(key)
+            checkpoint = json.loads(turn.get("checkpoint_json") or "{}")
+            marker = checkpoint.get("tool_in_flight")
+            if not marker:
+                raise ValueError(
+                    "This request has no uncertain connector call to reconcile."
+                )
+            messages = checkpoint.get("messages", [])
+            completed = {
+                item.get("tool_call_id")
+                for item in messages
+                if item.get("role") == "tool"
+            }
+            calls = [
+                call
+                for item in messages
+                for call in item.get("tool_calls", [])
+                if call.get("id") not in completed
+            ]
+            call = marker if isinstance(marker, dict) else (calls[0] if calls else None)
+            if not call or not call.get("id"):
+                raise ValueError(
+                    "The saved connector call lacks an identity; review its raw checkpoint before continuing."
+                )
+            reported = json.dumps(
+                {
+                    "reconciliation": "user_reported",
+                    "reported_by": str(actor.id),
+                    "result": result,
+                }
+            )
+            messages.append(
+                {"role": "tool", "tool_call_id": call["id"], "content": reported}
+            )
+            checkpoint.setdefault("trace", []).append(
+                {"tool": call["function"]["name"], "result": reported}
+            )
+            checkpoint["pending_tools"] = [
+                item
+                for item in checkpoint.get("pending_tools", calls)
+                if item.get("id") != call["id"]
+            ]
+            checkpoint["tool_in_flight"] = False
+            operation = json.loads(turn.get("operation_json") or "{}")
+            status = (
+                ("deleting" if operation.get("kind") == "delete" else "revising")
+                if operation
+                else "recovering"
+            )
+            self.store.checkpoint_turn(
+                key,
+                status=status,
+                checkpoint=checkpoint,
+                detail="Connector result recorded from the prompt author; continuing saved work.",
+            )
+        await self._resume_turn(key)
+
+    async def delete_messages(self, channel, targets, preserve_turn_key=None):
         targets = [
             message
             for message in targets
@@ -684,7 +1378,11 @@ class Together(discord.Client):
             except Exception:
                 self.internal_deletes.discard(message.id)
                 raise
-            self.store.remove_message(message.id)
+            row = self.store.db.execute(
+                "SELECT turn_key FROM messages WHERE source_id=?", (str(message.id),)
+            ).fetchone()
+            if not preserve_turn_key or not row or row["turn_key"] != preserve_turn_key:
+                self.store.remove_message(message.id)
 
     async def on_raw_message_delete(self, event):
         self.invalidate_image_cache(event.message_id)
@@ -699,88 +1397,48 @@ class Together(discord.Client):
         if message_id in self.internal_deletes:
             self.internal_deletes.discard(message_id)
             return
-        if not self.store.has_message(message_id):
-            return
-        room = str(channel_id)
-        self.room_epochs[room] = self.room_epochs.get(room, 0) + 1
-        async with self.room_locks.setdefault(room, asyncio.Lock()):
-            turn = self.store.remove_message(message_id)
-            if turn:
-                channel = self.get_channel(channel_id) or await self.fetch_channel(
-                    channel_id
-                )
-                outputs = []
-                for output_id in json.loads(turn["output_ids"]):
-                    try:
-                        outputs.append(await channel.fetch_message(int(output_id)))
-                    except discord.NotFound:
-                        pass
-                await self.delete_messages(channel, outputs)
+        turn = self.store.turn_by_source(message_id)
+        if turn:
+            self.queue_turn_operation(turn["key"], "delete")
+            await self._resume_turn(turn["key"])
+        else:
+            self.store.remove_message(message_id)
 
     async def on_raw_message_edit(self, event):
         self.invalidate_image_cache(event.message_id)
-        attachments_updated = "attachments" in event.data
-        if "content" not in event.data and not attachments_updated:
+        if "content" not in event.data and "attachments" not in event.data:
             return
-        if not self.store.has_message(
-            event.message_id
-        ) and not self.store.turn_by_source(event.message_id):
-            return
-        room = str(event.channel_id)
         turn = self.store.turn_by_source(event.message_id)
+        if turn:
+            # Persist before fetching the revised source. Failures/restarts resume
+            # cleanup from the same operation and retain any uncertain acceptance.
+            self.queue_source_refresh(turn["key"], data=event.data)
+            active = self.active_turns.get(turn["key"])
+            if active and not active.done() and not active.cancelling():
+                return
+            await self._resume_turn(turn["key"])
+            return
+        if not self.store.has_message(event.message_id):
+            return
         try:
-            source_channel = self.get_channel(
+            channel = self.get_channel(event.channel_id) or await self.fetch_channel(
                 event.channel_id
-            ) or await self.fetch_channel(event.channel_id)
-            source = await source_channel.fetch_message(event.message_id)
+            )
+            source = await channel.fetch_message(event.message_id)
             if source.author.bot:
                 return
-            prompt = re.sub(rf"<@!?{self.user.id}>", "", source.content).strip()
-            if not prompt and has_image_attachment(source):
-                prompt = "Describe the attached image."
-            edited_at = source.edited_at.isoformat() if source.edited_at else None
-            stored = self.store.db.execute(
-                "SELECT content,edited_at FROM messages WHERE source_id=?",
-                (str(source.id),),
-            ).fetchone()
-            if not edited_at or (stored and stored["edited_at"] == edited_at):
-                return
-            if (
-                stored
-                and stored["content"] == f"{source.author.display_name}: {prompt}"
-                and not attachments_updated
-            ):
-                self.store.observe(
-                    room, source.id, source.author.display_name, prompt, edited_at
-                )
-                return
-            self.room_epochs[room] = self.room_epochs.get(room, 0) + 1
+            snapshot = self.source_snapshot(source)
             self.store.observe(
-                room, source.id, source.author.display_name, prompt, edited_at
+                str(event.channel_id),
+                source.id,
+                source.author.display_name,
+                snapshot["source_prompt"],
+                snapshot["source_edited_at"],
             )
-            if turn:
-                revised = (
-                    None if attachments_updated and prompt == turn["prompt"] else prompt
-                )
-                await self.revise_turn(turn["key"], source.author, revised)
-            else:
-                if isinstance(source_channel, discord.Thread):
-                    async with self.room_locks.setdefault(room, asyncio.Lock()):
-                        targets = [
-                            m
-                            async for m in source_channel.history(
-                                limit=None, after=discord.Object(id=source.id)
-                            )
-                        ]
-                        await self.delete_messages(source_channel, targets)
-                self.schedule_ambient(source)
+            self.schedule_ambient(source)
         except Exception as error:
-            logging.error("Prompt edit failed (%s)", type(error).__name__)
-            target = self.get_channel(event.channel_id) or await self.fetch_channel(
-                event.channel_id
-            )
-            await target.send(
-                "Could not regenerate the edited prompt. " + safe_error(error)
+            logging.error(
+                "Observed message edit unavailable (%s)", type(error).__name__
             )
 
     async def generate_media(self, interaction, kind, prompt, model):
@@ -894,14 +1552,12 @@ class Together(discord.Client):
             isinstance(message.channel, discord.TextChannel)
             and message.channel.permissions_for(message.guild.default_role).view_channel
         )
-        directed = in_thread or self.user in message.mentions or replied
+        directed = in_thread or self.mentioned_directly(message) or replied
         if not directed and not public_channel and not in_thread:
             return
         if self.store.turn_by_source(message.id):
             return
-        prompt = re.sub(rf"<@!?{self.user.id}>", "", message.content).strip()
-        if not prompt and has_image_attachment(message):
-            prompt = "Describe the attached image."
+        prompt = self.normalized_source_prompt(message)
         self.store.observe(room, message.id, message.author.display_name, prompt)
         if not directed:
             if public_channel or in_thread:
@@ -936,7 +1592,18 @@ class Together(discord.Client):
         pending = self.ambient_tasks.pop(room, None)
         if pending:
             pending.cancel()
-        addressed_elsewhere = any(user.id != self.user.id for user in message.mentions)
+        mentioned_roles = {
+            int(value) for value in re.findall(r"<@&(\d+)>", message.content)
+        }
+        mentioned_roles.update(
+            role.id for role in getattr(message, "role_mentions", ())
+        )
+        addressed_elsewhere = (
+            any(user.id != self.user.id for user in message.mentions)
+            or bool(mentioned_roles - self.bot_role_ids(message.guild))
+            or getattr(message, "mention_everyone", False)
+            or bool(re.search(r"(?<!\w)@(everyone|here)\b", message.content))
+        )
         eligible = "?" in message.content or re.search(
             r"\b(why|how|what|who|help|explain|suggest|write|make|build|generate|ideas|thoughts|reply|tell|show|find|check|create)\b",
             message.content,
@@ -1122,6 +1789,21 @@ class Together(discord.Client):
             await i.response.defer(thinking=True)
             await self.revise_turn(
                 turn["key"], i.user, model=model, expected_version=turn["version"]
+            )
+
+        @tree.command(
+            name="reconcile",
+            description="Resume an uncertain connector call using the result you checked",
+        )
+        async def reconcile(i: discord.Interaction, result: str):
+            turn = store.latest_turn(str(i.channel_id))
+            if not turn:
+                raise ValueError("There is no saved request in this conversation.")
+            await i.response.defer(thinking=True)
+            await self.reconcile_turn(turn["key"], i.user, result)
+            await i.followup.send(
+                "Recorded your checked connector result and resumed the saved request.",
+                ephemeral=True,
             )
 
         @tree.command(
@@ -1331,6 +2013,7 @@ class Together(discord.Client):
             await i.response.defer()
             room = str(i.channel_id)
             self.room_epochs[room] = self.room_epochs.get(room, 0) + 1
+            self.cancel_room_turns(room)
             async with self.room_locks.setdefault(room, asyncio.Lock()):
                 store.reset(str(i.channel_id))
             await i.followup.send(

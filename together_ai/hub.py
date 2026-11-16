@@ -3,13 +3,12 @@
 import asyncio
 import io
 import json
-import re
 import time
 import uuid
 
 import discord
 
-from .bot import Together, has_image_attachment
+from .bot import Together
 
 
 def telemetry_value(value):
@@ -79,6 +78,7 @@ class HubTogether(Together):
     def __init__(self, path, config, instance, state):
         self.instance, self.hub_state = instance, state
         self.turn_tasks = set()
+        self.draft_sources = {}
         self.project_observed_sources = set()
         super().__init__(path, config)
         self.tree.interaction_check = self.command_check
@@ -306,7 +306,7 @@ class HubTogether(Together):
             )
             directed = (
                 in_thread
-                or self.user in message.mentions
+                or self.mentioned_directly(message)
                 or (
                     message.reference
                     and isinstance(message.reference.resolved, discord.Message)
@@ -314,9 +314,7 @@ class HubTogether(Together):
                 )
             )
             if directed:
-                prompt = re.sub(rf"<@!?{self.user.id}>", "", message.content).strip()
-                if not prompt and has_image_attachment(message):
-                    prompt = "Describe the attached image."
+                prompt = self.normalized_source_prompt(message)
                 if prompt:
                     try:
                         await self.run_turn(
@@ -384,8 +382,11 @@ class HubTogether(Together):
                     prompt,
                     kind="message" if source_id else "command",
                 )
-            self.hub_runtime.name_new_thread(self, channel.id, prompt)
+            if not self.instance.get("dry_run"):
+                self.hub_runtime.name_new_thread(self, channel.id, prompt)
         self.turn_tasks.add(asyncio.current_task())
+        if self.instance.get("dry_run") and source_id:
+            self.draft_sources[str(source_id)] = asyncio.current_task()
         self.emit(
             "turn.requested",
             {
@@ -404,6 +405,8 @@ class HubTogether(Together):
                             source = await channel.fetch_message(int(source_id))
                         except discord.NotFound:
                             return None
+                        if not source.author.bot:
+                            prompt = self.normalized_source_prompt(source)
                     context = (
                         self.store.history(
                             str(channel.id), exclude_source=source_id, with_sources=True
@@ -419,7 +422,14 @@ class HubTogether(Together):
                         if source
                         else []
                     )
-                    context = await self.image_history(channel, context, budget)
+                    context = await self.image_history(
+                        channel,
+                        context,
+                        budget,
+                        prompt=prompt,
+                        include_previous=bool(images)
+                        or isinstance(channel, discord.Thread),
+                    )
                     selected, answer, _ = await self.engine.ask(
                         str(channel.id),
                         prompt,
@@ -492,6 +502,11 @@ class HubTogether(Together):
             raise
         finally:
             self.turn_tasks.discard(asyncio.current_task())
+            if (
+                source_id
+                and self.draft_sources.get(str(source_id)) is asyncio.current_task()
+            ):
+                self.draft_sources.pop(str(source_id), None)
 
     async def revise_turn(
         self, key, actor, prompt=None, model=None, expected_version=None
@@ -522,7 +537,13 @@ class HubTogether(Together):
             return channel
         except asyncio.CancelledError:
             if self.store.turn(key):
-                self.store.fail_turn(key)
+                current = self.store.turn(key)
+                if current["status"] in {"pending", "recovering", "waiting"}:
+                    self.store.checkpoint_turn(
+                        key,
+                        status="recovering",
+                        detail="Interrupted; resume after reconnect.",
+                    )
             raise
         finally:
             self.turn_tasks.discard(task)

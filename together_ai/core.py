@@ -6,6 +6,9 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 import httpx
+from jsonschema import Draft202012Validator
+
+from .inference import FreeInferenceRouter
 from mcp import ClientSession, types
 from mcp.client.streamable_http import streamable_http_client
 
@@ -84,10 +87,27 @@ class Store:
             }
             if "anchor_id" not in turn_columns:
                 self.db.execute("ALTER TABLE turns ADD COLUMN anchor_id TEXT")
+            for column in (
+                "request_json",
+                "checkpoint_json",
+                "recovery_detail",
+                "operation_json",
+            ):
+                if column not in turn_columns:
+                    self.db.execute(f"ALTER TABLE turns ADD COLUMN {column} TEXT")
 
-    def history(self, room, exclude_source=None, exclude_turn=None, with_sources=False):
+    def history(
+        self,
+        room,
+        exclude_source=None,
+        exclude_turn=None,
+        with_sources=False,
+        before_turn=None,
+    ):
+        boundary = self.turn(before_turn) if before_turn else None
+        request = json.loads(boundary.get("request_json") or "{}") if boundary else {}
         rows = self.db.execute(
-            "SELECT role,content,source_id FROM messages WHERE room=? AND (? IS NULL OR source_id IS NULL OR source_id!=?) AND (? IS NULL OR turn_key IS NULL OR turn_key!=?) ORDER BY id",
+            "SELECT id,role,content,source_id,turn_key FROM messages WHERE room=? AND (? IS NULL OR source_id IS NULL OR source_id!=?) AND (? IS NULL OR turn_key IS NULL OR turn_key!=?) ORDER BY id",
             (
                 room,
                 str(exclude_source) if exclude_source else None,
@@ -97,7 +117,18 @@ class Store:
             ),
         )
         result = []
-        for role, content, source_id in rows:
+        for row in rows:
+            role, content, source_id = row["role"], row["content"], row["source_id"]
+            if boundary:
+                owner = self.turn(row["turn_key"]) if row["turn_key"] else None
+                if owner:
+                    if owner["seq"] >= boundary["seq"]:
+                        continue
+                elif source_id and boundary["source_id"]:
+                    if int(source_id) >= int(boundary["source_id"]):
+                        continue
+                elif row["id"] > request.get("history_boundary", 0):
+                    continue
             message = {"role": role, "content": content}
             if with_sources:
                 message["source_id"] = source_id
@@ -240,7 +271,7 @@ class Store:
 
     def latest_turn(self, room):
         row = self.db.execute(
-            "SELECT * FROM turns WHERE room=? AND status IN ('complete','failed','pending','response_deleted') ORDER BY seq DESC LIMIT 1",
+            "SELECT * FROM turns WHERE room=? AND status IN ('complete','failed','pending','recovering','waiting','waiting_user','delivering','revising','deleting','response_deleted') ORDER BY seq DESC LIMIT 1",
             (room,),
         ).fetchone()
         return dict(row) if row else None
@@ -256,10 +287,11 @@ class Store:
         skill,
         source_id,
         anchor_id=None,
+        request=None,
     ):
         with self.db:
             self.db.execute(
-                "INSERT INTO turns(key,room,author_id,author_name,prompt,model,skill,source_id,context,anchor_id) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                "INSERT INTO turns(key,room,author_id,author_name,prompt,model,skill,source_id,context,anchor_id,request_json) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     key,
                     room,
@@ -271,6 +303,7 @@ class Store:
                     str(source_id) if source_id else None,
                     "[]",
                     str(anchor_id or source_id) if anchor_id or source_id else None,
+                    json.dumps(request) if request is not None else None,
                 ),
             )
 
@@ -294,15 +327,52 @@ class Store:
                 outputs[0] if outputs else None,
             )
             self.db.execute(
-                "UPDATE turns SET prompt=?,model=?,answer=?,output_ids=?,version=version+1,status='complete' WHERE key=?",
+                "UPDATE turns SET prompt=?,model=?,answer=?,output_ids=?,version=version+1,status='complete',recovery_detail=NULL,checkpoint_json=NULL WHERE key=?",
                 (prompt, model, answer, json.dumps(outputs), key),
             )
+
+    def checkpoint_turn(
+        self,
+        key,
+        *,
+        status=None,
+        request=None,
+        checkpoint=None,
+        detail=None,
+        operation=None,
+    ):
+        changes = {
+            "status": status,
+            "request_json": json.dumps(request) if request is not None else None,
+            "checkpoint_json": (
+                json.dumps(checkpoint) if checkpoint is not None else None
+            ),
+            "recovery_detail": detail,
+            "operation_json": json.dumps(operation) if operation is not None else None,
+        }
+        changes = {name: value for name, value in changes.items() if value is not None}
+        if changes:
+            with self.db:
+                self.db.execute(
+                    "UPDATE turns SET "
+                    + ",".join(name + "=?" for name in changes)
+                    + " WHERE key=?",
+                    (*changes.values(), key),
+                )
+
+    def pending_turns(self):
+        return [
+            dict(row)
+            for row in self.db.execute(
+                "SELECT * FROM turns WHERE status IN ('pending','recovering','waiting','delivering','revising','deleting') ORDER BY seq"
+            )
+        ]
 
     def fail_turn(self, key):
         with self.db:
             self.db.execute("UPDATE turns SET status='failed' WHERE key=?", (key,))
 
-    def rewind(self, key, prompt, truncate=True):
+    def rewind(self, key, prompt, truncate=True, request=None, model=None):
         turn = self.turn(key)
         with self.db:
             self.db.execute(
@@ -327,6 +397,15 @@ class Store:
                 self.db.execute(
                     "DELETE FROM turn_revisions WHERE turn_key=?", (later_key,)
                 )
+            if truncate:
+                boundary = self.db.execute(
+                    "SELECT id FROM messages WHERE source_id=?", (turn["source_id"],)
+                ).fetchone()
+                if boundary:
+                    self.db.execute(
+                        "DELETE FROM messages WHERE room=? AND id>? AND turn_key IS NULL",
+                        (turn["room"], boundary["id"]),
+                    )
             self.db.execute(
                 "DELETE FROM messages WHERE turn_key=? AND role='assistant'", (key,)
             )
@@ -335,14 +414,20 @@ class Store:
                 (f"{turn['author_name']}: {prompt}", key),
             )
             self.db.execute(
-                "UPDATE turns SET prompt=?,status='pending',output_ids='[]' WHERE key=?",
-                (prompt, key),
+                "UPDATE turns SET prompt=?,status='pending',answer='',output_ids='[]',checkpoint_json=NULL,recovery_detail=NULL,operation_json=NULL,request_json=COALESCE(?,request_json),model=COALESCE(?,model) WHERE key=?",
+                (
+                    prompt,
+                    json.dumps(request) if request is not None else None,
+                    model,
+                    key,
+                ),
             )
 
     def discard_pending(self, key):
         with self.db:
             self.db.execute(
-                "DELETE FROM turns WHERE key=? AND status='pending'", (key,)
+                "DELETE FROM turns WHERE key=? AND status IN ('pending','recovering','waiting')",
+                (key,),
             )
 
     def model(self, room, default):
@@ -378,7 +463,16 @@ class Engine:
             timeout=120, headers={"Authorization": f"Bearer {key}"}
         )
         self.models = []
+        self.used_routes = {
+            row[0]
+            for row in store.db.execute(
+                "SELECT DISTINCT model FROM turns WHERE model IS NOT NULL"
+            )
+        }
         self.catalog = []
+        self.router = FreeInferenceRouter(
+            config, self.http, catalog=self.refresh_models
+        )
         self.tools = {}
         self.locks = {}
         self.skills = dict(SKILLS)
@@ -390,10 +484,31 @@ class Engine:
             self.skills[name] = Path(path).read_text()[:24000]
 
     async def refresh_models(self):
-        response = await self.http.get(self.config["base_url"] + "/models")
-        response.raise_for_status()
-        self.catalog = [m for m in response.json()["data"]]
-        self.models = [m["id"] for m in self.catalog]
+        try:
+            response = await self.http.get(
+                self.config["base_url"] + "/models", timeout=10
+            )
+            response.raise_for_status()
+            records = response.json()
+            if isinstance(records, dict):
+                records = records.get("data")
+            if isinstance(records, list):
+                valid = [
+                    item
+                    for item in records
+                    if isinstance(item, dict)
+                    and isinstance(item.get("id"), str)
+                    and item["id"]
+                ]
+                if valid:
+                    self.catalog = valid
+        except (httpx.HTTPError, ValueError, TypeError, TimeoutError):
+            # A catalog outage must not prevent the bot from resuming free inference.
+            pass
+        self.models = list(
+            dict.fromkeys(["auto/best-free"] + [m["id"] for m in self.catalog])
+        )
+        return self.catalog
 
     def media_models(self, kind):
         return [
@@ -408,7 +523,11 @@ class Engine:
             if model in self.models
             else self.config.get("aliases", {}).get(model, model)
         )
-        if resolved not in self.models:
+        if (
+            resolved not in self.models
+            and resolved not in self.used_routes
+            and resolved != "auto/best-free"
+        ):
             raise ValueError("Unknown model. Use /models to find one.")
         return resolved
 
@@ -466,6 +585,9 @@ class Engine:
         casual=False,
         ambient=False,
         participation="quiet",
+        progress=None,
+        checkpoint=None,
+        resume=None,
     ):
         if not prompt.strip():
             raise ValueError("Please include a message.")
@@ -544,15 +666,6 @@ class Engine:
                 + context
                 + [{"role": "user", "content": content}]
             )
-            image_input = any(
-                isinstance(message.get("content"), list)
-                and any(
-                    part.get("type") == "image_url"
-                    for part in message["content"]
-                    if isinstance(part, dict)
-                )
-                for message in messages
-            )
             tools = [
                 {
                     "type": "function",
@@ -564,54 +677,102 @@ class Engine:
                 }
                 for name, (_, tool) in self.tools.items()
             ]
-            trace = []
-            for _ in range(5):
-                body = {"model": selected, "messages": messages, "max_tokens": 1800}
-                if tools:
-                    body["tools"] = tools
-                for attempt in range(2):
-                    response = await self.http.post(
-                        self.config["base_url"] + "/chat/completions", json=body
+            base_count = len(messages)
+            trace = list((resume or {}).get("trace", []))
+            pending_tools = list((resume or {}).get("pending_tools", []))
+            if resume:
+                if resume.get("tool_in_flight"):
+                    raise ValueError(
+                        "A connector's acceptance is uncertain. Review it before requesting another call."
                     )
-                    if response.status_code not in {429, 502, 503, 504} or attempt:
-                        break
-                    await asyncio.sleep(1)
-                if not response.is_success:
-                    if image_input and response.status_code in {400, 415, 422}:
-                        raise RuntimeError(
-                            "This AI route rejected image input. Select a vision-capable route and retry."
-                        )
-                    raise RuntimeError(
-                        f"AI provider returned HTTP {response.status_code}. Try another model or retry shortly."
+                saved = resume.get("messages")
+                if saved:
+                    # Restore the complete original input, including its system message.
+                    # Only attachment bytes are rehydrated from the frozen source list.
+                    fresh = messages
+                    messages = json.loads(json.dumps(saved))
+                    base_count = resume.get("base_count", len(fresh))
+                    for index, item in enumerate(fresh[:base_count]):
+                        if index >= len(messages):
+                            break
+                        parts = item.get("content")
+                        if isinstance(parts, list):
+                            images_now = [
+                                part
+                                for part in parts
+                                if part.get("type") == "image_url"
+                            ]
+                            if images_now:
+                                content = messages[index].get("content", "")
+                                messages[index]["content"] = (
+                                    [{"type": "text", "text": content}]
+                                    if isinstance(content, str)
+                                    else content
+                                ) + images_now
+
+            async def save_checkpoint(tool_in_flight=False):
+                if checkpoint:
+                    # Reload original attachments from Discord on resume; never persist image bytes.
+                    saved_messages = []
+                    for item in messages:
+                        saved = dict(item)
+                        if isinstance(saved.get("content"), list):
+                            saved["content"] = [
+                                part
+                                for part in saved["content"]
+                                if part.get("type") != "image_url"
+                            ]
+                        saved_messages.append(saved)
+                    await checkpoint(
+                        {
+                            "messages": saved_messages,
+                            "base_count": base_count,
+                            "trace": trace,
+                            "tool_in_flight": tool_in_flight,
+                            "pending_tools": pending_tools,
+                            "round_count": round_count,
+                            "epoch": round_count // 5,
+                        }
                     )
-                payload = response.json()
-                trace.append(payload)
-                message = payload["choices"][0]["message"]
-                if not message.get("tool_calls"):
-                    answer = (
-                        message.get("content")
-                        or "The provider returned an empty answer. Please retry."
-                    )
-                    if persist:
-                        self.store.append(room, utterance, answer)
-                    return selected, answer, trace
-                messages.append(
-                    {
-                        k: v
-                        for k, v in message.items()
-                        if k in {"role", "content", "tool_calls", "reasoning_details"}
-                    }
-                )
-                for call in message["tool_calls"]:
+
+            round_count = int((resume or {}).get("round_count", 0))
+
+            def validate_call(call):
+                name = call["function"]["name"]
+                arguments = json.loads(call["function"]["arguments"])
+                if name not in self.tools or not isinstance(arguments, dict):
+                    raise ValueError("Unknown tool or invalid connector arguments")
+                if not isinstance(call.get("id"), str) or not call["id"]:
+                    raise ValueError("Missing tool call id")
+                schema = self.tools[name][1].input_schema
+                if next(Draft202012Validator(schema).iter_errors(arguments), None):
+                    raise ValueError("Arguments do not match the connector schema")
+                return name, arguments
+
+            while True:
+                # An epoch is a cancellation/checkpoint boundary, never a tool budget.
+                await asyncio.sleep(0)
+                while pending_tools:
+                    call = pending_tools[0]
+                    # Invalid arguments/unknown names are definite local rejections:
+                    # no connector has been contacted yet.
                     try:
-                        result = await self.call_tool(
-                            call["function"]["name"],
-                            json.loads(call["function"]["arguments"]),
-                        )
-                    except Exception:
-                        result = (
-                            "The connector call failed. Report the failure accurately."
-                        )
+                        name, arguments = validate_call(call)
+                    except (KeyError, ValueError, TypeError):
+                        self.router.reject_last_response("invalid connector call")
+                        result = "Connector request rejected locally: unknown tool or invalid arguments."
+                    else:
+                        await save_checkpoint(tool_in_flight=call)
+                        try:
+                            result = await self.call_tool(name, arguments)
+                        except Exception as error:
+                            # A transport error does not establish whether the remote
+                            # connector accepted the action. Keep the in-flight marker.
+                            raise ValueError(
+                                "Connector acceptance is uncertain after "
+                                + type(error).__name__
+                                + ". Reconcile the connector result before continuing."
+                            ) from error
                     messages.append(
                         {
                             "role": "tool",
@@ -620,9 +781,61 @@ class Engine:
                         }
                     )
                     trace.append({"tool": call["function"]["name"], "result": result})
-            raise RuntimeError(
-                "The request reached its connector step limit. Please narrow the request."
-            )
+                    pending_tools.pop(0)
+                    await save_checkpoint()
+                body = {"model": selected, "messages": messages, "max_tokens": 1800}
+                if tools:
+                    body["tools"] = tools
+                await save_checkpoint()
+                response = await self.router.post(body, progress=progress)
+                round_count += 1
+                payload = response.json()
+                route = response.extensions.get("inference_route", {})
+                if route:
+                    payload = dict(payload, inference_route=route)
+                trace.append(payload)
+                message = payload["choices"][0]["message"]
+                if not message.get("tool_calls"):
+                    answer = message.get("content")
+                    if not isinstance(answer, str) or not answer.strip():
+                        self.router.reject_last_response("empty conversation answer")
+                        continue
+                    if persist:
+                        self.store.append(room, utterance, answer)
+                    canonical = (
+                        route.get("canonical_model") or payload.get("model") or selected
+                    )
+                    self.used_routes.add(canonical)
+                    return canonical, answer, trace
+                # Reject the complete batch before any remote execution. A malformed
+                # envelope must not poison the saved conversation or replay a call.
+                try:
+                    calls = message["tool_calls"]
+                    if not isinstance(calls, list):
+                        raise ValueError("Tool calls must be a list")
+                    ids = {
+                        item["tool_call_id"]
+                        for item in messages
+                        if item.get("role") == "tool"
+                    }
+                    for call in calls:
+                        validate_call(call)
+                        if call["id"] in ids:
+                            raise ValueError("Repeated tool call id")
+                        ids.add(call["id"])
+                except (KeyError, ValueError, TypeError):
+                    self.router.reject_last_response("invalid connector call batch")
+                    await save_checkpoint()
+                    continue
+                messages.append(
+                    {
+                        k: v
+                        for k, v in message.items()
+                        if k in {"role", "content", "tool_calls", "reasoning_details"}
+                    }
+                )
+                pending_tools = list(message["tool_calls"])
+                await save_checkpoint()
 
     async def generate(self, kind, prompt, model):
         route = model or self.config.get("media_defaults", {}).get(kind)

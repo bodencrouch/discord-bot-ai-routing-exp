@@ -29,7 +29,31 @@ class SessionStore:
                 thread_id TEXT, kind TEXT NOT NULL
             )"""
         )
+        self.db.execute(
+            """CREATE TABLE IF NOT EXISTS planning_card_destinations (
+                job_id TEXT NOT NULL, channel_id TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                PRIMARY KEY (job_id, channel_id, kind)
+            )"""
+        )
         self.db.commit()
+
+    def record_card_destination(self, job_id, channel_id, kind):
+        """Journal before sending so retirement can find a lost acknowledgement."""
+        with self.lock, self.db:
+            self.db.execute(
+                "INSERT OR IGNORE INTO planning_card_destinations VALUES (?,?,?)",
+                (str(job_id), str(channel_id), str(kind)),
+            )
+
+    def card_destinations(self, job_id):
+        with self.lock:
+            return list(
+                self.db.execute(
+                    "SELECT channel_id,kind FROM planning_card_destinations WHERE job_id=?",
+                    (str(job_id),),
+                )
+            )
 
     def record_output(self, job_id, message_id, thread_id=None, kind="progress"):
         """Persist which job owns an outgoing Discord message."""
@@ -160,3 +184,42 @@ async def rewind_activity(bot, job_id, activity_message_id):
             raise
         deleted += 1
     return deleted
+
+
+class SourceDeleted(RuntimeError):
+    """The original Discord request no longer exists."""
+
+
+class ContextClarification(ValueError):
+    """The requester must supply a missing source or usable screenshot."""
+
+
+def recovery_delay(attempt):
+    """Bounded durable backoff; ordinary failures never exhaust a job."""
+    return min(300, 3 * 2 ** min(max(0, int(attempt) - 1), 7))
+
+
+def recovery_kind(error):
+    """Classify legacy exceptions and the free router's structured failures.
+
+    Messages are inspected locally, never copied to user-visible notes: provider
+    exceptions can contain credentials, URLs or private request bodies.
+    """
+    kind = getattr(error, "category", None) or getattr(error, "kind", None)
+    kind = {
+        "planning_lifecycle": "protocol",
+        "inference_configuration": "provider",
+    }.get(kind, kind)
+    if kind in {"provider", "protocol", "source_context", "step_budget"}:
+        return kind
+    detail = str(error).lower()
+    if any(word in detail for word in ("budget", "max_turn", "turn action")):
+        return "step_budget"
+    if any(
+        word in detail
+        for word in ("json", "schema", "protocol", "tool_call", "proposal")
+    ):
+        return "protocol"
+    if isinstance(error, discord.HTTPException):
+        return "source_context"
+    return "provider"

@@ -6,7 +6,7 @@ PRESETS = {
         "name": "Together AI",
         "label": "Together AI",
         "description": "Shared conversations, model routes, skills and connected tools.",
-        "defaults": {"model": "auto/fast", "dry_run": False, "channels": []},
+        "defaults": {"model": "auto/best-free", "dry_run": False, "channels": []},
     },
     "maintenance": {
         "id": "maintenance",
@@ -20,7 +20,7 @@ PRESETS = {
         "name": "Predictor",
         "label": "Predictor",
         "description": "Draft predictions, collect feedback and review outcomes.",
-        "defaults": {"model": "auto/fast", "dry_run": True, "channels": []},
+        "defaults": {"model": "auto/best-free", "dry_run": True, "channels": []},
     },
 }
 

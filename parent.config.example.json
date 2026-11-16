@@ -6,6 +6,6 @@
     "token_file": "/absolute/private/parent-token",
     "energy_hook": "/absolute/path/to/protecting-your-energy/hooks/energy.py",
     "model": "auto/best-free",
-    "planning_fallback_model": "auto/fast",
+    "planning_fallback_model": "auto/best-free",
     "planning_reasoning_effort": "low"
 }

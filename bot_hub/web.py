@@ -40,8 +40,12 @@ class Dashboard:
                 result.raise_for_status()
                 self.models = result.json()["data"]
                 self.model_error = None
+                if not any(item.get("id") == "auto/best-free" for item in self.models):
+                    self.models.insert(0, {"id": "auto/best-free"})
         except Exception as exc:
             self.model_error = type(exc).__name__
+            if not self.models:
+                self.models = [{"id": "auto/best-free"}]
 
     def jobs(self):
         jobs = []
@@ -90,15 +94,23 @@ class Dashboard:
                 )
                 connection.row_factory = sqlite3.Row
                 for room in connection.execute(
-                    "SELECT room,COUNT(*) AS message_count FROM messages GROUP BY room ORDER BY MAX(id) DESC LIMIT 100"
+                    "SELECT room,SUM(message_count) AS message_count FROM (SELECT room,COUNT(*) AS message_count FROM messages GROUP BY room UNION ALL SELECT room,0 FROM turns GROUP BY room) GROUP BY room LIMIT 100"
                 ).fetchall():
                     title = connection.execute(
                         "SELECT title FROM conversations WHERE room=?", (room["room"],)
                     ).fetchone()
+                    turn_columns = {
+                        row[1] for row in connection.execute("PRAGMA table_info(turns)")
+                    }
+                    detail_column = (
+                        ",recovery_detail" if "recovery_detail" in turn_columns else ""
+                    )
                     turns = [
                         dict(row)
                         for row in connection.execute(
-                            "SELECT key,prompt,answer,author_name,model,status,version,source_id,output_ids FROM turns WHERE room=? ORDER BY seq DESC LIMIT 50",
+                            "SELECT key,prompt,answer,author_name,model,status,version,source_id,output_ids"
+                            + detail_column
+                            + " FROM turns WHERE room=? ORDER BY seq DESC LIMIT 50",
                             (room["room"],),
                         )
                     ]
@@ -212,7 +224,12 @@ class Dashboard:
                     "uncertainty": project.get("data", {}).get("unresolved")
                     or "Project membership is inferred from attributed source messages.",
                     "reconstruction_source": {
-                        "model": "auto/fast",
+                        "model": project.get("data", {})
+                        .get("inference_route", {})
+                        .get("canonical_model"),
+                        "inference_route": project.get("data", {}).get(
+                            "inference_route"
+                        ),
                         "skills": project_snapshot["skills"],
                         "coverage": project_snapshot["coverage"],
                     },
@@ -233,7 +250,7 @@ class Dashboard:
             "naming": {
                 item["id"]: {
                     "enabled": True,
-                    "model": "auto/fast",
+                    "model": "auto/best-free",
                     "description": "Default-titled AI threads are named from their first meaningful prompt. Explicit member titles are preserved.",
                 }
                 for item in instances

@@ -58,9 +58,11 @@ class HubParent(Parent):
                     {
                         "model": model,
                         "error": type(error).__name__,
-                        "detail": str(error)
-                        if str(error).startswith("Incomplete planning stream:")
-                        else None,
+                        "detail": (
+                            str(error)
+                            if str(error).startswith("Incomplete planning stream:")
+                            else None
+                        ),
                     },
                 )
                 raise
@@ -149,7 +151,8 @@ class HubParent(Parent):
         )
 
     async def card(self, job_id, attach=False):
-        if not self.cleanup_running():
+        job = self.get(job_id)
+        if not self.cleanup_running() or (job and job["card_retired"]):
             await super().card(job_id, attach=attach)
 
     async def on_raw_message_edit(self, payload):
@@ -468,7 +471,7 @@ class Runtime:
                 settings.setdefault(
                     "model", PRESETS["maintenance"]["defaults"]["model"]
                 )
-                settings.setdefault("planning_fallback_model", "auto/fast")
+                settings.setdefault("planning_fallback_model", "auto/best-free")
                 settings.setdefault("channel_id", 0)
                 controller = HostMaintenance(client, settings, self)
                 client.maintenance_controller = controller
@@ -683,9 +686,9 @@ class Runtime:
                 str(message_id),
                 {"id": str(author.id), "name": author.display_name, "role": role},
                 content,
-                thread_id=str(channel.id)
-                if isinstance(channel, discord.Thread)
-                else None,
+                thread_id=(
+                    str(channel.id) if isinstance(channel, discord.Thread) else None
+                ),
                 kind=kind,
             )
         except Exception as error:
@@ -716,6 +719,9 @@ class Runtime:
             or not {"content", "attachments"}.intersection(event.data)
         ):
             return
+        self.invalidate_component_predictions(
+            client, message_ids=[event.message_id], reason="source edited"
+        )
         try:
             channel = client.get_channel(
                 event.channel_id
@@ -733,6 +739,12 @@ class Runtime:
     async def remove_project_sources(self, client, message_ids=(), thread_ids=()):
         if self.cleanup.is_running(str(client.config["guild_id"])):
             return
+        self.invalidate_component_predictions(
+            client,
+            message_ids=message_ids,
+            thread_ids=thread_ids,
+            reason="source deleted",
+        )
         try:
             await self.projects.remove_sources(
                 [str(value) for value in message_ids],
@@ -745,6 +757,18 @@ class Runtime:
                 {"error": type(error).__name__},
             )
 
+    def invalidate_component_predictions(
+        self, client, *, message_ids=(), thread_ids=(), reason
+    ):
+        for instance_id, host_id in list(self.component_hosts.items()):
+            component = self.clients.get(instance_id)
+            if host_id == client.instance["id"] and hasattr(
+                component, "cancel_pending"
+            ):
+                component.cancel_pending(
+                    source_ids=message_ids, channel_ids=thread_ids, reason=reason
+                )
+
     def remember_thread(self, client, thread):
         self.pending_thread_names[str(thread.id)] = {
             "instance_id": client.instance["id"],
@@ -754,6 +778,8 @@ class Runtime:
         }
 
     def name_new_thread(self, client, thread_id, text, expected_name=None, prefix=""):
+        if client.instance.get("dry_run"):
+            return
         thread_id = str(thread_id)
         if expected_name is not None:
             self.pending_thread_names.setdefault(
@@ -787,6 +813,8 @@ class Runtime:
         task.add_done_callback(lambda done: self.naming_tasks.pop(thread_id, None))
 
     async def _name_thread(self, client, thread_id, text):
+        if client.instance.get("dry_run"):
+            return
         pending = self.pending_thread_names[thread_id]
         try:
             thread = client.get_channel(int(thread_id)) or await client.fetch_channel(
@@ -806,6 +834,13 @@ class Runtime:
                 self.pending_thread_names.pop(thread_id, None)
                 return
             title = (pending["prefix"] + title)[:100]
+            if client.instance.get("dry_run"):
+                self.state.record(
+                    client.instance["id"],
+                    "thread.naming_draft",
+                    {"thread_id": thread_id, "name": title, "executed": False},
+                )
+                return
             await thread.edit(
                 name=title, reason="Name a new AI thread from its first prompt"
             )
@@ -817,7 +852,14 @@ class Runtime:
             self.state.record(
                 client.instance["id"],
                 "thread.named",
-                {"thread_id": thread_id, "name": title, "model": "auto/fast"},
+                {
+                    "thread_id": thread_id,
+                    "name": title,
+                    "model": self.projects.thread_routes.get(thread_id, {}).get(
+                        "canonical_model"
+                    ),
+                    "inference_route": self.projects.thread_routes.get(thread_id, {}),
+                },
             )
         except asyncio.CancelledError:
             raise
@@ -907,6 +949,20 @@ class Runtime:
             )
             if shared and task and not task.done():
                 running = True
+            recovery = []
+            if client and hasattr(client, "store"):
+                recovery = [
+                    {
+                        "turn_key": row["key"],
+                        "channel_id": row["room"],
+                        "state": row["status"],
+                        "detail": row["recovery_detail"],
+                        "model": row["model"],
+                    }
+                    for row in client.store.db.execute(
+                        "SELECT key,room,status,recovery_detail,model FROM turns WHERE status IN ('pending','recovering','waiting','waiting_user','delivering','revising','deleting')"
+                    )
+                ]
             statuses.append(
                 {
                     "id": instance_id,
@@ -918,6 +974,7 @@ class Runtime:
                     "connected": connected,
                     "running": running,
                     "error": self.errors.get(instance_id),
+                    "recovery": recovery,
                 }
             )
         return statuses
@@ -1142,6 +1199,7 @@ class Runtime:
                 or self.clients.get(host_id) is not host
             ):
                 return
+            self.bind_prediction_lifecycle(host)
             await component.attach(host)
             component._hub_attached = True
             self.state.record(
@@ -1154,6 +1212,40 @@ class Runtime:
             self.state.record(
                 instance_id, "component.failed", {"error": type(error).__name__}
             )
+
+    def bind_prediction_lifecycle(self, host):
+        """Invalidate drafts before a native edit handler can await regeneration."""
+        if getattr(host, "_prediction_lifecycle_bound", False):
+            return
+        host._prediction_lifecycle_bound = True
+        for name in (
+            "on_raw_message_edit",
+            "on_raw_message_delete",
+            "on_raw_bulk_message_delete",
+        ):
+            original = getattr(host, name)
+
+            async def forward(event, original=original, name=name):
+                if str(getattr(event, "guild_id", "")) == str(host.config["guild_id"]):
+                    if name != "on_raw_message_edit" or {
+                        "content",
+                        "attachments",
+                    }.intersection(event.data):
+                        ids = (
+                            event.message_ids
+                            if name == "on_raw_bulk_message_delete"
+                            else [event.message_id]
+                        )
+                        self.invalidate_component_predictions(
+                            host,
+                            message_ids=ids,
+                            reason="source edited"
+                            if name == "on_raw_message_edit"
+                            else "source deleted",
+                        )
+                return await original(event)
+
+            setattr(host, name, forward)
 
     async def _start_dependents(self, host_id):
         for instance in self.instances():
@@ -1224,6 +1316,7 @@ class Runtime:
                 await self._stop(instance["id"])
             importlib.invalidate_caches()
             for module_name in (
+                "together_ai.inference",
                 "together_ai.core",
                 "together_ai.routing",
                 "together_ai.conversations",

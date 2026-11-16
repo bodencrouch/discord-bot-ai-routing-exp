@@ -1,6 +1,7 @@
 """Reviewed, administrator-initiated Discord server cleanup."""
 
 import asyncio
+import hashlib
 import json
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -427,6 +428,73 @@ class CleanupManager:
             and client.get_guild(int(guild_id))
         ]
 
+    @staticmethod
+    def _maintenance_clients(clients):
+        """Keep physical clients and hosted maintenance owners exactly once."""
+        result, seen = [], set()
+        for client in clients:
+            for owner in (client, getattr(client, "maintenance_controller", None)):
+                if owner is not None and id(owner) not in seen:
+                    seen.add(id(owner))
+                    result.append(owner)
+        return result
+
+    async def _retire_maintenance(self, clients, data):
+        """Freeze job ownership from this reviewed scope; never re-inventory it."""
+        controllers = {
+            str(owner.instance["id"])
+            + ":"
+            + hashlib.sha256(str(owner.config["database"]).encode()).hexdigest(): owner
+            for owner in self._maintenance_clients(clients)
+            if hasattr(owner, "retire_cards")
+        }
+        if "maintenance_retirements" not in data:
+            message_ids = {
+                str(value) for room in data["rooms"] for value in room["messages"]
+            }
+            thread_ids = {
+                str(room["id"]) for room in data["rooms"] if room["ai_thread"]
+            }
+            cutoff = int(data["cutoff_id"])
+            data["maintenance_retirements"] = [
+                {
+                    "controller": key,
+                    "jobs": [
+                        job["id"]
+                        for job in owner.db.execute("SELECT * FROM jobs").fetchall()
+                        if str(job["source"]) in message_ids
+                        or any(
+                            str(job[field]) in message_ids
+                            for field in ("card", "thread_card")
+                        )
+                        or (
+                            str(job["thread"]) in thread_ids
+                            and int(job["source"]) <= cutoff
+                        )
+                    ],
+                }
+                for key, owner in controllers.items()
+            ]
+            # This is a progress receipt, not a replacement reviewed snapshot.
+            # Persist before awaiting so restart/cancellation uses these same IDs.
+            self._save(data)
+        complete = True
+        for receipt in data["maintenance_retirements"]:
+            if not receipt["jobs"]:
+                continue
+            owner = controllers.get(receipt["controller"])
+            if owner is None:
+                complete = False
+                continue
+            task = asyncio.create_task(owner.retire_cards(receipt["jobs"]))
+            try:
+                settled = await asyncio.shield(task)
+            except asyncio.CancelledError:
+                await task
+                raise
+            complete = settled and complete
+        return complete
+
     async def preview(self, guild_id):
         """Central preview entrypoint for buttons, /cleanup and the dashboard.
         Serialized per guild; supersedes older previews and retires their cards
@@ -456,7 +524,7 @@ class CleanupManager:
         cutoff = discord.utils.time_snowflake(datetime.now(timezone.utc), high=True)
         bot_ids = {str(item.user.id) for item in clients}
         known_rooms = set()
-        for item in clients:
+        for item in self._maintenance_clients(clients):
             if hasattr(item, "store"):
                 known_rooms.update(
                     str(row[0])
@@ -680,6 +748,15 @@ class CleanupManager:
                         ).me.guild_permissions.manage_messages,
                     ),
                 )
+                if not await self._retire_maintenance(clients, data):
+                    result["errors"].append(
+                        {"operation": "maintenance_retirement", "error": "Pending"}
+                    )
+                    data.update(status="partial", running=False)
+                    self._save(data)
+                    if progress:
+                        await progress(result)
+                    return result
                 old_boundary = discord.utils.time_snowflake(
                     datetime.now(timezone.utc) - timedelta(days=14)
                 )
@@ -810,11 +887,12 @@ class CleanupManager:
                     await asyncio.shield(reconcile)
                 except asyncio.CancelledError:
                     await reconcile
+                self._save(data)
                 raise
             finally:
                 self.running.discard(guild_id)
                 self.active_runs.discard(asyncio.current_task())
-                for item in self.clients(guild_id):
+                for item in self._maintenance_clients(self.clients(guild_id)):
                     if hasattr(item, "wake"):
                         item.wake.set()
 
@@ -922,26 +1000,51 @@ class CleanupManager:
         for task in component_tasks:
             task.cancel()
         await asyncio.gather(*component_tasks, return_exceptions=True)
-        for client in clients:
+        for client in self._maintenance_clients(clients):
             for job_id, task in list(getattr(client, "active_jobs", {}).items()):
                 if not task.done():
                     job = client.get(job_id)
                     if job and job["state"] == "applying":
-                        await asyncio.shield(task)
+                        try:
+                            await asyncio.shield(task)
+                        except asyncio.CancelledError:
+                            await task
+                            raise
                     else:
                         task.cancel()
                         await asyncio.gather(task, return_exceptions=True)
+                        current = client.get(job_id)
+                        if (
+                            job
+                            and current
+                            and current["version"] == job["version"]
+                            and current["state"] == "planning"
+                        ):
+                            client.update(
+                                job_id,
+                                state="recovering",
+                                recovery_target="queued",
+                                next_retry=0,
+                                note="Server cleanup paused planning. The saved checkpoint will resume when cleanup finishes.",
+                            )
             tasks = set(getattr(client, "turn_tasks", set()))
             tasks.update(getattr(client, "ambient_tasks", {}).values())
             for task in tasks:
                 task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
+            if hasattr(client, "quiesce_card_deliveries"):
+                barrier = asyncio.create_task(client.quiesce_card_deliveries())
+                try:
+                    await asyncio.shield(barrier)
+                except asyncio.CancelledError:
+                    await barrier
+                    raise
 
     async def _reconcile(self, clients, deleted_ids, deleted_threads, data):
         rooms = {
             room["id"] for room in data["rooms"] if set(room["messages"]) <= deleted_ids
         }
-        for client in clients:
+        for client in self._maintenance_clients(clients):
             if hasattr(client, "store"):
                 affected_turns = []
                 for turn in client.store.db.execute(
@@ -981,24 +1084,41 @@ class CleanupManager:
                             "DELETE FROM messages WHERE room=?", (thread_id,)
                         )
             if hasattr(client, "db"):
-                for job in client.db.execute("SELECT * FROM jobs").fetchall():
-                    if (
-                        str(job["source"]) in deleted_ids
-                        or str(job["thread"]) in deleted_threads
+                affected = [
+                    job
+                    for job in client.db.execute("SELECT * FROM jobs").fetchall()
+                    if str(job["source"]) in deleted_ids
+                    or str(job["thread"]) in deleted_threads
+                    or any(
+                        str(job[field]) in deleted_ids
+                        for field in ("card", "thread_card")
+                    )
+                ]
+                unsettled = [
+                    job["id"]
+                    for job in affected
+                    if not job["card_retired"] or job["card_retirement_pending"]
+                ]
+                if unsettled and not await client.retire_cards(unsettled):
+                    data["result"]["errors"].append(
+                        {"operation": "maintenance_retirement", "error": "Pending"}
+                    )
+                    continue
+                for job in affected:
+                    if job["state"] in {"done", "cancelled"} and not any(
+                        job[field] for field in ("card", "thread_card", "thread")
                     ):
-                        if job["state"] in {"done", "cancelled"} and not any(
-                            job[field] for field in ("card", "thread_card", "thread")
-                        ):
-                            continue
-                        client.update(
-                            job["id"],
-                            state="done" if job["state"] == "done" else "cancelled",
-                            version=job["version"] + 1,
-                            card=None,
-                            thread_card=None,
-                            thread=None,
-                            note="Server cleanup retired these Discord controls.",
-                        )
+                        continue
+                    client.update(
+                        job["id"],
+                        state="done" if job["state"] == "done" else "cancelled",
+                        version=job["version"] + 1,
+                        card=None,
+                        thread_card=None,
+                        thread=None,
+                        card_retirement_pending=0,
+                        note="Server cleanup retired these Discord controls.",
+                    )
         for prediction in self.state.predictions(limit=None):
             if (
                 prediction.get("message_id") in deleted_ids

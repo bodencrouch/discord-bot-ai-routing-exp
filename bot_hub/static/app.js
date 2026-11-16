@@ -263,6 +263,8 @@ function eventMarkup(event) {
     data.message ||
     data.content ||
     data.error ||
+    data.detail ||
+    data.reason ||
     data.tool ||
     data.name ||
     data.model ||
@@ -400,6 +402,7 @@ function renderOverview(instance) {
         ? rows(instance.channels).join(", ")
         : "Preset configuration",
     ],
+    ["Recovery", rows(status.recovery).map((item) => `${item.state === "waiting_user" ? "Needs user input" : item.state === "delivering" ? "Delivering answer" : "Automatic recovery"} · ${item.channel_id} · ${item.detail || item.state}`).join("; ") || "No pending recovery"],
     ["Runtime error", status.error || "None recorded"],
     [
       "Gateway catalog",
@@ -463,7 +466,7 @@ function renderConversations() {
             /^\d+$/.test(String(item.guild_id)) && /^\d+$/.test(room)
               ? `https://discord.com/channels/${item.guild_id}/${room}`
               : "";
-          return `<details class="panel conversation-card" data-room="${escapeHTML(room)}" ${expandedConversations.has(room) ? "open" : ""}><summary><span><strong>${text(item.title || room || "Conversation")}</strong><small>${text(room)} · ${turns.length} stored turns · ${text(item.message_count ?? "Unknown")} context messages</small></span><span class="quiet">⌄</span></summary><div class="conversation-content">${discordURL ? `<a class="text-link" href="${discordURL}" target="_blank" rel="noopener noreferrer">Open Discord thread ↗</a>` : ""}${turns.length ? turns.map((turn) => `<article class="conversation-turn"><div class="turn-meta"><strong>${text(turn.author_name || "Unknown author")}</strong><span class="badge">${text(turn.status || "Status unavailable")}</span><span class="mono quiet">${text(turn.model || "Route unavailable")}${turn.version != null ? ` · v${text(turn.version)}` : ""}</span><a href="/api/turns/${encodeURIComponent(item.instance_id)}/${encodeURIComponent(turn.key)}" target="_blank" rel="noopener noreferrer">Raw JSON ↗</a></div><h3>Prompt</h3><p>${text(turn.prompt || "Prompt unavailable.")}</p><h3>Answer</h3><p>${text(turn.answer || "Answer unavailable.")}</p></article>`).join("") : empty("No stored turns were returned for this thread.")}</div></details>`;
+          return `<details class="panel conversation-card" data-room="${escapeHTML(room)}" ${expandedConversations.has(room) ? "open" : ""}><summary><span><strong>${text(item.title || room || "Conversation")}</strong><small>${text(room)} · ${turns.length} stored turns · ${text(item.message_count ?? "Unknown")} context messages</small></span><span class="quiet">⌄</span></summary><div class="conversation-content">${discordURL ? `<a class="text-link" href="${discordURL}" target="_blank" rel="noopener noreferrer">Open Discord thread ↗</a>` : ""}${turns.length ? turns.map((turn) => `<article class="conversation-turn"><div class="turn-meta"><strong>${text(turn.author_name || "Unknown author")}</strong><span class="badge">${text(({recovering: "Recovering automatically", waiting: "Waiting for automatic recovery", waiting_user: "Needs user input", delivering: "Delivering answer", revising: "Reconciling source edit", deleting: "Reconciling source deletion", pending: "Queued"})[turn.status] || turn.status || "Status unavailable")}</span><span class="mono quiet">${text(turn.model || "Route unavailable")}${turn.version != null ? ` · v${text(turn.version)}` : ""}</span><a href="/api/turns/${encodeURIComponent(item.instance_id)}/${encodeURIComponent(turn.key)}" target="_blank" rel="noopener noreferrer">Raw JSON ↗</a></div><h3>Prompt</h3><p>${text(turn.prompt || "Prompt unavailable.")}</p>${turn.recovery_detail ? `<p class="quiet">${text(turn.recovery_detail)}</p>` : ""}<h3>Answer</h3><p>${text(turn.answer || "Answer pending.")}</p></article>`).join("") : empty("No stored turns were returned for this thread.")}</div></details>`;
         })
         .join("")
     : empty(
@@ -639,7 +642,7 @@ function renderProjects() {
   const enabled = naming.enabled ?? configuration.auto_thread_naming;
   $("#naming-status").textContent =
     enabled === true
-      ? "Enabled · new conversation threads use auto/fast"
+      ? "Enabled · new conversation threads use auto/best-free"
       : enabled === false
         ? "Disabled"
         : "Naming status unavailable";

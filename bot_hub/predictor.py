@@ -2,6 +2,7 @@
 
 import asyncio
 from difflib import SequenceMatcher
+import hashlib
 import json
 import time
 from pathlib import Path
@@ -10,6 +11,8 @@ import uuid
 
 import discord
 import httpx
+
+from together_ai.inference import FreeInferenceRouter
 
 from .learning import LocalLearning
 
@@ -25,9 +28,9 @@ class FeedbackModal(discord.ui.Modal):
         )
         self.predictor, self.prediction_id, self.kind = predictor, prediction_id, kind
         self.text = discord.ui.TextInput(
-            label="Your expected response"
-            if kind == "edit"
-            else "What should improve?",
+            label=(
+                "Your expected response" if kind == "edit" else "What should improve?"
+            ),
             style=discord.TextStyle.paragraph,
             max_length=1800,
         )
@@ -70,6 +73,8 @@ class PredictionView(discord.ui.View):
 
 
 class Predictor(discord.Client):
+    pending_statuses = {"pending", "ready", "delivering"}
+
     def __init__(self, instance, state, gateway_config):
         intents = discord.Intents.default()
         intents.message_content = True
@@ -90,8 +95,12 @@ class Predictor(discord.Client):
         self.component_views = []
         self.channel_locks = {}
         self.gateway_http = None
+        self.router = None
         self.seen = set()
         self.message_tasks = set()
+        self.generation_tasks = {}
+        self.recovery_task = None
+        self.latest_sources = {}
         self.standalone_started = False
 
     async def start(self, token, *, reconnect=True):
@@ -180,6 +189,7 @@ class Predictor(discord.Client):
         self.gateway_http = httpx.AsyncClient(
             timeout=90, headers={"Authorization": f"Bearer {key}"}
         )
+        self.router = FreeInferenceRouter(self.config, self.gateway_http)
         # Stable custom IDs are restored for every retained prediction message.
         for record in self.state.predictions(
             instance_id=self.instance["id"], limit=None
@@ -197,13 +207,21 @@ class Predictor(discord.Client):
             "connection.ready",
             {"user_id": str(self.user.id), "indexed_pairs": self.learning.count()},
         )
+        if self.recovery_task is None or self.recovery_task.done():
+            self.recovery_task = asyncio.create_task(self.recover_pending())
 
     async def on_disconnect(self):
         self.record("connection.disconnected", {})
 
     async def close(self):
+        if self.recovery_task:
+            self.recovery_task.cancel()
+            await asyncio.gather(self.recovery_task, return_exceptions=True)
+            self.recovery_task = None
         pending = [
-            task for task in self.message_tasks if task is not asyncio.current_task()
+            task
+            for task in self.message_tasks | set(self.generation_tasks.values())
+            if task is not asyncio.current_task()
         ]
         for task in pending:
             task.cancel()
@@ -223,6 +241,129 @@ class Predictor(discord.Client):
 
     def record(self, kind, payload):
         self.state.record(self.instance["id"], kind, payload)
+
+    def active_prediction(self, prediction_id):
+        record = self.prediction(prediction_id)
+        if (
+            not record
+            or record.get("status") not in self.pending_statuses
+            or not self.instance.get("enabled", True)
+            or record.get("payload", {}).get("superseded_by")
+        ):
+            return None
+        return record
+
+    def cancel_pending(
+        self, *, source_ids=(), channel_ids=(), before=None, reason="cancelled"
+    ):
+        """Persist invalidation before cancelling tasks; late inference cannot revive it."""
+        source_ids = {str(value) for value in source_ids}
+        channel_ids = {str(value) for value in channel_ids}
+        for record in self.state.predictions(
+            instance_id=self.instance["id"], limit=None
+        ):
+            sources = {str(record.get("source_message_id"))}
+            sources.update(
+                item["id"] for item in record.get("generation", {}).get("sources", [])
+            )
+            matches = (
+                bool(sources & source_ids)
+                or str(record.get("channel_id")) in channel_ids
+            )
+            if not matches or record.get("status") not in self.pending_statuses:
+                continue
+            if before is not None and int(record["source_message_id"]) >= int(before):
+                continue
+            record["status"] = "cancelled"
+            record["cancel_reason"] = reason
+            self.state.save_prediction(record)
+            task = self.generation_tasks.get(record["id"])
+            if task and task is not asyncio.current_task():
+                task.cancel()
+
+    async def recover_pending(self):
+        while True:
+            for record in self.state.predictions(
+                instance_id=self.instance["id"], limit=None
+            ):
+                if (
+                    self.active_prediction(record["id"])
+                    or record.get("delivery_pending")
+                ) and record["id"] not in self.generation_tasks:
+                    task = asyncio.create_task(self.run_prediction(record))
+                    self.generation_tasks[record["id"]] = task
+            await asyncio.sleep(2)
+
+    async def run_prediction(self, record, message=None):
+        prediction_id = record["id"]
+        self.generation_tasks[prediction_id] = asyncio.current_task()
+        try:
+            record = self.prediction(prediction_id) or record
+            if record.get("delivery_pending"):
+                channel = self.get_channel(
+                    int(record["channel_id"])
+                ) or await self.fetch_channel(int(record["channel_id"]))
+                # A send may have been accepted before a crash/timeout. Reconcile
+                # its stable component ID; never send that draft a second time.
+                async for sent in channel.history(
+                    limit=None,
+                    after=discord.Object(id=int(record["source_message_id"])),
+                ):
+                    ids = [
+                        getattr(button, "custom_id", "")
+                        for row in sent.components
+                        for button in row.children
+                    ]
+                    if (
+                        sent.author.id == self.user.id
+                        and f"predict:{prediction_id}:up" in ids
+                    ):
+                        if self.active_prediction(prediction_id):
+                            await self.sources_current(record, channel)
+                        if self.active_prediction(prediction_id):
+                            self.add_view(
+                                PredictionView(self, prediction_id), message_id=sent.id
+                            )
+                        await self.complete_delivery(record, sent)
+                        return
+                return
+            if not self.active_prediction(prediction_id):
+                return
+            if message is None:
+                channel = self.get_channel(
+                    int(record["channel_id"])
+                ) or await self.fetch_channel(int(record["channel_id"]))
+                message = await channel.fetch_message(int(record["source_message_id"]))
+            if not self.allowed(message.channel):
+                self.cancel_pending(source_ids=[message.id], reason="scope changed")
+                return
+            await self.finish_prediction(record, message)
+        except discord.NotFound:
+            self.cancel_pending(
+                source_ids=[record["source_message_id"]], reason="source deleted"
+            )
+        except asyncio.CancelledError:
+            # Shutdown preserves durable pending state. Explicit invalidation has
+            # already persisted its terminal state before cancelling this task.
+            raise
+        except Exception as error:
+            self.record(
+                "prediction.recovering",
+                {"prediction_id": prediction_id, "error_type": type(error).__name__},
+            )
+        finally:
+            if self.generation_tasks.get(prediction_id) is asyncio.current_task():
+                self.generation_tasks.pop(prediction_id, None)
+
+    async def on_raw_message_edit(self, event):
+        if {"content", "attachments"}.intersection(event.data):
+            self.cancel_pending(source_ids=[event.message_id], reason="source edited")
+
+    async def on_raw_message_delete(self, event):
+        self.cancel_pending(source_ids=[event.message_id], reason="source deleted")
+
+    async def on_raw_bulk_message_delete(self, event):
+        self.cancel_pending(source_ids=event.message_ids, reason="source deleted")
 
     def prediction(self, prediction_id):
         if hasattr(self.state, "prediction"):
@@ -306,14 +447,17 @@ class Predictor(discord.Client):
 
     async def generate(self, system, prompt, max_tokens=450):
         model = self.instance.get("model") or self.config.get(
-            "default_model", "auto/fast"
+            "default_model", "auto/best-free"
         )
         model = self.config.get("aliases", {}).get(model, model)
         started = time.monotonic()
         self.record("model.started", {"model": model})
-        response = await self.gateway_http.post(
-            self.config["base_url"].rstrip("/") + "/chat/completions",
-            json={
+
+        async def progress(detail):
+            self.record("model.recovering", {"model": model, "detail": detail})
+
+        response = await self.router.post(
+            {
                 "model": model,
                 "messages": [
                     {"role": "system", "content": system},
@@ -322,6 +466,7 @@ class Predictor(discord.Client):
                 "max_tokens": max_tokens,
                 "response_format": {"type": "json_object"},
             },
+            progress=progress,
         )
         response.raise_for_status()
         payload = response.json()
@@ -329,7 +474,11 @@ class Predictor(discord.Client):
             "model.completed",
             {
                 "model": model,
+                "canonical_model": response.extensions.get("inference_route", {}).get(
+                    "canonical_model"
+                ),
                 "actual_model": payload.get("model"),
+                "inference_route": response.extensions.get("inference_route", {}),
                 "usage": payload.get("usage"),
                 "latency_ms": round((time.monotonic() - started) * 1000),
             },
@@ -393,9 +542,12 @@ class Predictor(discord.Client):
                     "score": SequenceMatcher(
                         None, words(predicted), words(message.content)
                     ).ratio(),
-                    "equivalent": True
-                    if words(predicted) and words(predicted) == words(message.content)
-                    else None,
+                    "equivalent": (
+                        True
+                        if words(predicted)
+                        and words(predicted) == words(message.content)
+                        else None
+                    ),
                     "method": "lexical_fallback",
                     "reason": "Lexical overlap only. Semantic judgment unavailable.",
                 }
@@ -452,6 +604,14 @@ class Predictor(discord.Client):
         )
         if not is_owner and not automatic:
             return
+        self.latest_sources[message.channel.id] = max(
+            message.id, self.latest_sources.get(message.channel.id, 0)
+        )
+        self.cancel_pending(
+            channel_ids=[message.channel.id],
+            before=message.id,
+            reason="superseded by newer conversation message",
+        )
         lock = self.channel_locks.setdefault(message.channel.id, asyncio.Lock())
         async with lock:
             if is_owner and not explicit:
@@ -464,7 +624,6 @@ class Predictor(discord.Client):
             # A source message may already have a persisted prediction after restart.
             if any(
                 str(item.get("source_message_id")) == str(message.id)
-                and item.get("message_id")
                 for item in self.state.predictions(
                     instance_id=self.instance["id"], limit=None
                 )
@@ -491,11 +650,6 @@ class Predictor(discord.Client):
                         "error_type": type(error).__name__,
                     },
                 )
-                if explicit or isinstance(error, InvalidFollowup):
-                    await message.reply(
-                        "Bot prediction unavailable. The failure was recorded for review.",
-                        mention_author=False,
-                    )
 
     @staticmethod
     def parse_followup(raw):
@@ -503,7 +657,12 @@ class Predictor(discord.Client):
             raw.removeprefix("```json").removeprefix("```").removesuffix("```").strip()
         )
         text = result.get("followup") if isinstance(result, dict) else None
-        if not isinstance(text, str) or not text.strip() or len(text) > 1800:
+        if (
+            not isinstance(text, str)
+            or not text.strip()
+            or len(text) > 1800
+            or set(result) != {"followup"}
+        ):
             raise ValueError(
                 "Return a JSON object containing a nonempty followup under 1800 characters"
             )
@@ -548,7 +707,10 @@ class Predictor(discord.Client):
             'Output: {"followup":"great, can you also make it persist after restart?"}'
         )
         request = {"conversation": context, "generic_preferences": profile}
-        for attempt in range(2):
+        attempt = 0
+        while True:
+            await asyncio.sleep(0)
+            attempt += 1
             raw = ""
             try:
                 raw = await self.generate(
@@ -558,14 +720,14 @@ class Predictor(discord.Client):
                     450,
                 )
                 return self.parse_followup(raw)
-            except (ValueError, TypeError) as error:
+            except (ValueError, TypeError, KeyError, IndexError) as error:
+                self.router.reject_last_response("invalid direct-followup JSON/schema")
                 self.record(
                     "prediction_output_rejected",
-                    {"attempt": attempt + 1, "reason": str(error)[:300]},
+                    {"attempt": attempt, "reason": type(error).__name__},
                 )
                 request["rejected_draft"] = raw[:2400]
                 request["correction"] = str(error)
-        raise InvalidFollowup("The provider failed direct-followup validation twice")
 
     async def conversation_text(self, message):
         """Recover complete Together answers when Discord displays an attachment stub."""
@@ -583,6 +745,58 @@ class Predictor(discord.Client):
                         content = await attachment.read()
                         return content.decode("utf-8", errors="replace")[:16000]
         return message.content[:16000]
+
+    async def source_snapshot(self, message, text=None):
+        text = await self.conversation_text(message) if text is None else text
+        data = {
+            "content": message.content,
+            "text": text,
+            "edited_at": str(getattr(message, "edited_at", None)),
+            "attachments": [
+                str(item.id) for item in getattr(message, "attachments", [])
+            ],
+        }
+        return {
+            "id": str(message.id),
+            "digest": hashlib.sha256(
+                json.dumps(data, sort_keys=True).encode()
+            ).hexdigest(),
+        }
+
+    async def sources_current(self, record, channel):
+        if not self.active_prediction(record["id"]):
+            return False
+        for saved in record["generation"]["sources"]:
+            try:
+                source = await channel.fetch_message(int(saved["id"]))
+            except discord.NotFound:
+                self.cancel_pending(source_ids=[saved["id"]], reason="source deleted")
+                return False
+            if await self.source_snapshot(source) != saved:
+                self.cancel_pending(source_ids=[saved["id"]], reason="source edited")
+                return False
+        bots = {
+            str(value)
+            for value in self.config.get("together_bot_ids", [])
+            + self.instance.get("together_bot_ids", [])
+        }
+        if self.host:
+            bots.add(str(self.host.user.id))
+        async for item in channel.history(
+            limit=None, after=discord.Object(id=int(record["source_message_id"]))
+        ):
+            if self.is_prediction(item):
+                continue
+            if str(item.author.id) == self.owner_id or (
+                str(item.author.id) in bots and self.is_answer(item)
+            ):
+                self.cancel_pending(
+                    channel_ids=[channel.id],
+                    before=item.id,
+                    reason="superseded by newer conversation message",
+                )
+                return False
+        return bool(self.active_prediction(record["id"]))
 
     async def predict(self, message):
         # Web UI feedback shares the same durable State, so import it idempotently.
@@ -603,7 +817,7 @@ class Predictor(discord.Client):
                     record.get("payload", {}).get("patterns", []),
                     feedback["user_id"],
                 )
-        context = []
+        context, sources = [], []
         async for item in message.channel.history(limit=16, before=message):
             if self.is_prediction(item):
                 continue
@@ -616,26 +830,33 @@ class Predictor(discord.Client):
             if self.host:
                 bots.add(str(self.host.user.id))
             if str(item.author.id) == self.owner_id or str(item.author.id) in bots:
+                text = await self.conversation_text(item)
+                sources.append(await self.source_snapshot(item, text))
                 context.append(
                     {
-                        "author": "owner"
-                        if str(item.author.id) == self.owner_id
-                        else "Together AI",
-                        "text": await self.conversation_text(item),
+                        "author": (
+                            "owner"
+                            if str(item.author.id) == self.owner_id
+                            else "Together AI"
+                        ),
+                        "text": text,
                     }
                 )
         context.reverse()
+        text = await self.conversation_text(message)
+        sources.append(await self.source_snapshot(message, text))
         context.append(
             {
                 "author": "Together AI" if message.author.bot else "owner request",
-                "text": await self.conversation_text(message),
+                "text": text,
             }
         )
         grounding = await asyncio.to_thread(
             self.learning.grounding,
             "\n".join(item["text"] for item in reversed(context)),
         )
-        text = await self.draft_followup(context, grounding["profile"])
+        if self.latest_sources.get(message.channel.id, message.id) > message.id:
+            return
         record = self.state.save_prediction(
             {
                 "id": uuid.uuid4().hex,
@@ -643,14 +864,36 @@ class Predictor(discord.Client):
                 "channel_id": str(message.channel.id),
                 "source_message_id": str(message.id),
                 "dry_run": self.instance.get("dry_run", True),
-                "payload": {"text": text[:1800], "context": context, **grounding},
+                "status": "pending",
+                "generation": {
+                    "context": context,
+                    "profile": grounding["profile"],
+                    "sources": sources,
+                },
+                "payload": {"context": context, **grounding},
             }
         )
-        mode = (
-            "Dry-run proposed response"
-            if self.instance.get("dry_run", True)
-            else "Proposed response"
-        )
+        await self.run_prediction(record, message)
+
+    async def finish_prediction(self, record, message):
+        if not await self.sources_current(record, message.channel):
+            return
+        if record["status"] == "pending":
+            inputs = record["generation"]
+            text = await self.draft_followup(inputs["context"], inputs["profile"])
+            record = self.active_prediction(record["id"])
+            if not record:
+                return
+            record["payload"]["text"] = text
+            record["status"] = "ready"
+            self.state.save_prediction(record)
+        if not await self.sources_current(record, message.channel):
+            return
+        record = self.active_prediction(record["id"])
+        if not record:
+            return
+        text = record["payload"]["text"]
+        mode = "Dry-run proposed response" if record["dry_run"] else "Proposed response"
         embed = discord.Embed(
             title=f"Bot prediction · {mode}", description=text[:1800], color=0x78909C
         )
@@ -658,22 +901,47 @@ class Predictor(discord.Client):
             text="Uncertain, uncalibrated prediction · Local archive patterns · Owner feedback improves future drafts"
         )
         view = PredictionView(self, record["id"])
+        record["status"] = "delivering"
+        record["delivery_pending"] = True
+        self.state.save_prediction(record)
         try:
-            if self.instance.get("dry_run", True):
-                sent = await message.reply(embed=embed, view=view, mention_author=False)
+            if record["dry_run"]:
+                sent = await message.reply(
+                    embed=embed,
+                    view=view,
+                    mention_author=False,
+                    nonce=record["id"][:24],
+                )
             else:
                 sent = await message.reply(
                     content="**Bot prediction**\n" + text[:1800],
                     view=view,
                     mention_author=False,
+                    nonce=record["id"][:24],
                 )
-        except discord.HTTPException:
-            record["payload"]["delivery_failed"] = True
-            self.state.save_prediction(record)
+        except discord.HTTPException as error:
+            current = self.active_prediction(record["id"])
+            if current and 400 <= error.status < 500:
+                current.update(status="ready", delivery_pending=False)
+                self.state.save_prediction(current)
             raise
         if self.host:
             self.component_views.append(view)
+        await self.complete_delivery(record, sent)
+
+    async def complete_delivery(self, record, sent):
+        if not self.active_prediction(record["id"]):
+            try:
+                await sent.delete()
+            except discord.NotFound:
+                pass
+            current = self.prediction(record["id"])
+            if current:
+                current["delivery_pending"] = False
+                self.state.save_prediction(current)
+            return
         record = self.prediction(record["id"]) or record
+        record.update(status="complete", delivery_pending=False)
         record["message_id"] = str(sent.id)
         record["payload"]["message_id"] = str(sent.id)
         self.state.save_prediction(record)
