@@ -484,7 +484,7 @@ class Engine:
             system += (
                 "\nYou are a Discord bot with these actual commands: /chat message [model] [skill], "
                 "/thread [with_user] [title] [message] [participants] [model], /convo (same options), /new [title] [model], "
-                "/retry [model], /image prompt [model], /video prompt [model], /model [route], /models [search], /routes [alias] [model], "
+                "/retry [model], /video prompt [model], /model [route], /models [search], /routes [alias] [model], "
                 "/skills, /skill name message, /connectors, /tool name [arguments], /summarize [count], "
                 "/participation [level] [cooldown] [delay], /history, /reset, /status, /help. A route means an AI model or routing policy in OmniRoute. "
                 "Use /models to find routes and /model to select a channel's route. "

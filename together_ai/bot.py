@@ -29,7 +29,7 @@ Editing an earlier thread prompt rewinds the thread, removes later messages, and
 `/skills` lists skills. `/skill` runs one. You can also write `@Together AI @explain your question`.
 `/connectors` lists connected tools. `/tool` calls a tool with JSON arguments.
 `/summarize` summarizes recent channel messages. `/reset` clears AI conversation context.
-`/image` and `/video` use generation routes you connect in OmniRoute.
+`/video` uses generation routes you connect in OmniRoute.
 `/status` shows the current model and gateway. `/help` shows this guide.
 Messages sent to me and requested summaries go to the configured AI gateway. Answers are shared here."""
 
@@ -907,14 +907,6 @@ class Together(discord.Client):
             await i.response.send_message(
                 f"Participation **{settings['level']}** · waits {settings['delay']}s for a pause · at least {settings['cooldown']}s between unprompted replies.\nMention me or reply directly to my message for an answer at any level."
             )
-
-        @tree.command(
-            name="image",
-            description="Generate an image through a connected OmniRoute image route",
-        )
-        @app_commands.autocomplete(model=media_autocomplete)
-        async def image(i: discord.Interaction, prompt: str, model: str = None):
-            await self.generate_media(i, "image", prompt, model)
 
         @tree.command(
             name="video",
