@@ -7,6 +7,7 @@ import math
 import os
 import random
 import re
+import shlex
 import time
 from email.utils import parsedate_to_datetime
 import sys
@@ -22,6 +23,7 @@ PRIVATE_FIELDS = {
     "token_file",
     "database",
     "dashboard_login_file",
+    "planning_endpoint",
 }
 CONFIG_FIELDS = {
     "default_model",
@@ -409,13 +411,106 @@ class Changes:
         for key in ("PARENT_CONFIG", "BOT_HUB_CONFIG"):
             if os.environ.get(key):
                 self.private_paths.add((self.root / os.environ[key]).resolve())
+        endpoint = config.get("planning_endpoint") or {}
+        if isinstance(endpoint, dict) and endpoint.get("credential_env_file"):
+            self.private_paths.add(
+                (
+                    self.root / Path(endpoint["credential_env_file"]).expanduser()
+                ).resolve()
+            )
         self.planning_first_output_timeout = PlanningHTTPClient.positive_timeout(
             config.get("planning_first_output_timeout"), 90
         )
         self.planning_turn_timeout = PlanningHTTPClient.positive_timeout(
             config.get("planning_turn_timeout"), 240
         )
+        self.planning_request_lock = asyncio.Lock()
+        self.planning_next_request = 0.0
         self.http = PlanningHTTPClient(timeout=240)
+
+    def planning_transport(self, gateway):
+        endpoint = self.config.get("planning_endpoint")
+        if not endpoint:
+            return {
+                "base_url": gateway["base_url"].rstrip("/"),
+                "headers": {
+                    "Authorization": "Bearer "
+                    + Path(gateway["api_key_file"]).read_text().strip()
+                },
+                "transport_model": None,
+                "protocol": None,
+                "max_tokens": 24000,
+                "supports_response_format": True,
+                "min_interval_seconds": 0.0,
+            }
+        if not isinstance(endpoint, dict):
+            raise ValueError("planning_endpoint must be an object.")
+        url = httpx.URL(endpoint.get("base_url", ""))
+        if (
+            url.scheme != "https"
+            or not url.host
+            or url.userinfo
+            or url.query
+            or url.fragment
+        ):
+            raise ValueError(
+                "Planning endpoint must be an HTTPS base URL without credentials or query."
+            )
+        model = endpoint.get("transport_model")
+        protocol = endpoint.get("protocol", "json_actions")
+        max_tokens = endpoint.get("max_tokens", 4096)
+        if not isinstance(model, str) or not model.strip():
+            raise ValueError("Planning endpoint needs a transport_model.")
+        if protocol not in {"json_actions", "native"}:
+            raise ValueError("Unknown planning endpoint protocol.")
+        if type(max_tokens) is not int or not 1 <= max_tokens <= 24000:
+            raise ValueError(
+                "Planning endpoint max_tokens must be an integer from 1 to 24000."
+            )
+        env_name = endpoint.get("credential_env_name")
+        if not isinstance(env_name, str) or not re.fullmatch(
+            r"[A-Za-z_][A-Za-z0-9_]*", env_name
+        ):
+            raise ValueError("Planning endpoint needs a valid credential_env_name.")
+        key = None
+        env_file = endpoint.get("credential_env_file")
+        if not isinstance(env_file, str) or not env_file.strip():
+            raise ValueError("Planning endpoint needs a credential_env_file reference.")
+        env_path = self.root / Path(env_file).expanduser()
+        for line in env_path.read_text().splitlines():
+            line = line.strip()
+            if line.startswith("export "):
+                line = line[7:].lstrip()
+            name, separator, value = line.partition("=")
+            if separator and name.strip() == env_name:
+                parts = shlex.split(value, comments=True, posix=True)
+                if len(parts) == 1:
+                    key = parts[0]
+        if not key:
+            raise ValueError(
+                "Planning endpoint credential is unavailable in its configured env file."
+            )
+        supports_format = endpoint.get("supports_response_format", False)
+        if type(supports_format) is not bool:
+            raise ValueError("supports_response_format must be a boolean.")
+        interval = endpoint.get("min_interval_seconds", 0)
+        if (
+            type(interval) not in {int, float}
+            or not math.isfinite(interval)
+            or interval < 0
+        ):
+            raise ValueError(
+                "min_interval_seconds must be a finite nonnegative number."
+            )
+        return {
+            "base_url": str(url).rstrip("/"),
+            "headers": {"Authorization": "Bearer " + key},
+            "transport_model": model,
+            "protocol": protocol,
+            "max_tokens": max_tokens,
+            "supports_response_format": supports_format,
+            "min_interval_seconds": float(interval),
+        }
 
     def snapshot(self):
         files = {}
@@ -740,6 +835,7 @@ Preserve application readiness reporting, durable pending approvals and restart 
 Use the most recent follow-up as the user's current intent. Be concise and lightly memeish.
 """
         c = json.loads((self.root / "config.json").read_text())
+        transport = self.planning_transport(c)
 
         def tool(name, description, properties, required):
             return {
@@ -884,12 +980,19 @@ Use the most recent follow-up as the user's current intent. Be concise and light
             route = candidate
             attempted_routes.add(route)
             invalid_proposals = 0
-            use_json_format = True
-            if route == configured_route:
+            use_json_format = transport["supports_response_format"]
+            if transport["protocol"] == "json_actions" or route == configured_route:
                 activate_json_protocol()
             else:
                 json_protocol = False
-            route_trace.append({"model": route, "reason": reason})
+            route_trace.append(
+                {
+                    "model": route,
+                    "reason": reason,
+                    "transport_base_url": transport["base_url"],
+                    "transport_model": transport["transport_model"] or route,
+                }
+            )
             await emit(
                 f"The configured route could not complete this planning operation ({reason}). Using authorized fallback {route} for this operation. The configured planning default is {configured_route}."
             )
@@ -927,9 +1030,7 @@ Use the most recent follow-up as the user's current intent. Be concise and light
             },
             {"role": "user", "content": self.planning_content(request, base, context)},
         ]
-        headers = {
-            "Authorization": "Bearer " + Path(c["api_key_file"]).read_text().strip()
-        }
+        headers = transport["headers"]
         turn = 0
         request_hash = hashlib.sha256(str(request).encode()).hexdigest()
         context_hash = self.context_digest(context)
@@ -1063,6 +1164,24 @@ Use the most recent follow-up as the user's current intent. Be concise and light
                     "The prior checkpoint does not match the current source, request, or supplied context/images. Starting a fresh plan from the current snapshot."
                 )
 
+        if transport["transport_model"]:
+            route_trace.append(
+                {
+                    "model": route,
+                    "reason": "authorized planner transport override",
+                    "transport_base_url": transport["base_url"],
+                    "transport_model": transport["transport_model"],
+                }
+            )
+            await emit(
+                f"Planner transport override: logical route {route}, endpoint {transport['base_url']}, "
+                f"transport model {transport['transport_model']}."
+            )
+            use_json_format = transport["supports_response_format"]
+            if transport["protocol"] == "json_actions":
+                activate_json_protocol()
+                messages.append({"role": "user", "content": protocol_help})
+
         async def save_checkpoint():
             if not checkpoint:
                 return
@@ -1110,8 +1229,19 @@ Use the most recent follow-up as the user's current intent. Be concise and light
             for attempt in range(3):
                 response = None
                 try:
+                    if transport["min_interval_seconds"]:
+                        while True:
+                            async with self.planning_request_lock:
+                                now = time.monotonic()
+                                delay = self.planning_next_request - now
+                                if delay <= 0:
+                                    self.planning_next_request = (
+                                        now + transport["min_interval_seconds"]
+                                    )
+                                    break
+                            await asyncio.sleep(delay)
                     response = await self.http.post(
-                        c["base_url"].rstrip("/") + "/chat/completions",
+                        transport["base_url"] + "/chat/completions",
                         headers=headers,
                         json=body,
                         planning_progress=emit,
@@ -1188,8 +1318,8 @@ Use the most recent follow-up as the user's current intent. Be concise and light
             turn += 1
             await emit(f"Model turn {turn}: requesting the next action from {route}.")
             body = {
-                "model": route,
-                "max_tokens": 24000,
+                "model": transport["transport_model"] or route,
+                "max_tokens": transport["max_tokens"],
                 "messages": messages,
                 "stream": True,
             }
