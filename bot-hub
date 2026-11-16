@@ -1,0 +1,3 @@
+#!/bin/sh
+cd "$(dirname "$0")" || exit 1
+exec "${BOT_HUB_PYTHON:-.venv/bin/python}" -m bot_hub "$@"

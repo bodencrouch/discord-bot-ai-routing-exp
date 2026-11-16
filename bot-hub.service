@@ -1,0 +1,17 @@
+[Unit]
+Description=Discord bot hub and dashboard
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/run/media/brunner56/MyBook/Documents/Codex/2026-11-15/crea/outputs/together-ai
+Environment=BOT_HUB_CONFIG=/run/media/brunner56/MyBook/Documents/Codex/2026-11-15/crea/work/private/hub.json
+ExecStart=/run/media/brunner56/MyBook/Documents/Codex/2026-11-15/crea/outputs/together-ai/.venv/bin/python -m bot_hub
+Restart=always
+RestartSec=5
+UMask=0077
+NoNewPrivileges=true
+
+[Install]
+WantedBy=default.target

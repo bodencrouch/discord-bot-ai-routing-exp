@@ -1,0 +1,44 @@
+{
+  "database": "/absolute/private/hub.sqlite",
+  "dashboard_port": 18741,
+  "dashboard_login_file": "/absolute/private/dashboard-login",
+  "gateway_config_file": "/absolute/path/to/config.json",
+  "instances": [
+    {
+      "id": "together",
+      "name": "Together AI",
+      "preset": "chat",
+      "enabled": true,
+      "dry_run": false,
+      "token_file": "/absolute/private/together-token",
+      "config_file": "/absolute/path/to/together-config.json",
+      "model": "auto/fast",
+      "channels": []
+    },
+    {
+      "id": "skill-issue",
+      "name": "Skill Issue Department",
+      "preset": "maintenance",
+      "enabled": true,
+      "dry_run": false,
+      "token_file": "/absolute/private/skill-issue-token",
+      "config_file": "/absolute/path/to/skill-issue-config.json",
+      "model": "auto/best-free",
+      "channels": ["1571760182248218634"]
+    },
+    {
+      "id": "reply-guy",
+      "name": "Reply Guy",
+      "preset": "predictor",
+      "enabled": true,
+      "dry_run": true,
+      "config_file": "/absolute/path/to/reply-guy-config.json",
+      "model": "auto/fast",
+      "channels": [],
+      "owner_id": "227896831944687616",
+      "together_bot_ids": ["1571749853032218644"],
+      "identity_instance": "together",
+      "thread_scope": "conversations"
+    }
+  ]
+}

@@ -1,3 +1,25 @@
+# Discord Bot Hub
+
+The active application runs Together AI, Skill Issue Department and the Reply Guy predictor preset under one supervisor and dashboard. Together AI retains the chat identity. Reply Guy shares that identity and listens in Together AI conversation threads. Skill Issue Department retains its existing identity and management-channel scope.
+
+Run `python -m bot_hub --config /absolute/private/hub.json`, or use `bot-hub.service` on this host. `hub.example.json` lists the bundled instances. Configuration changes, model routes, channel scope, enabled state and dry-run mode are managed in the dashboard. The private dashboard login link is written to the configured `dashboard_login_file`. The HTTP server binds to loopback only and requires a session cookie for data and controls.
+
+The dashboard shows live connection state, conversation history, model and tool activity, maintenance proposals, prediction feedback and session exports. Activity charts reflect recorded events. Existing conversation and maintenance SQLite history is reused. New telemetry is retained in the hub database. Source archives and the private learning index stay outside the repository.
+
+## Prediction and review
+
+Reply Guy defaults to dry-run with the `auto/fast` route. Skill Issue Department uses `auto/best-free`. It posts a labelled proposed follow-up with Helpful, Missed, Edit and Review controls. Votes, edited drafts and reviews persist and inform later predictions. A subsequent message from the configured owner is compared with the original prediction by intent and constraints. A semantic score of at least 0.8 marks an estimated match. The predictor configuration can override this with `semantic_threshold`. Lexical fallback is labelled separately and establishes equivalence only for normalized exact text. These are uncalibrated estimates, and human reviews remain visible alongside them.
+
+The local archive index currently contains 22,470 deduplicated assistant/owner follow-up pairs. The private coverage record identifies reviewed collections and omissions, including three oversized Codex records. This is archive-informed retrieval with feedback, and exact imitation of a person is unverified. A bounded review of 46 pairs across 44 conversations supplies 11 contextual behavior/style guidelines, with aggregate style measurements across the index. Raw historical conversations stay local. The gateway receives inferred guidance, recent Discord feedback and current scoped Discord messages.
+
+Dry-run defaults off for chat and maintenance. Chat dry-run produces reviewable drafts and suppresses connector execution. Maintenance dry-run prepares a proposal and keeps installation blocked. Predictor dry-run always presents its draft explicitly as a bot prediction. All instance modes are configurable through the dashboard.
+
+## Migration on this host
+
+`bot-hub.service` replaces the two independently running service processes. The old `together-ai.service` and `skill-issue-department.service` units are disabled during migration. Their source modules remain reusable implementation components. Credentials stay in their existing private files, and the single hub registry references them. Maintenance reconnects chat through the supervisor so it can continue reporting progress while child code reloads.
+
+The reference sections below describe the reused chat and maintenance capabilities and their standalone commands.
+
 # Together AI
 
 A collaborative Discord bot backed by an OpenAI-compatible AI gateway, with shared channel conversations, dedicated threads, skills and MCP connectors.
@@ -58,7 +80,7 @@ Run commands from this directory, or invoke the `together-ai` script by absolute
 ./together-ai pipelines /absolute/path/omniroute-combos-export.json
 ./together-ai media video YOUR_VIDEO_ROUTE
 ./together-ai persona /absolute/path/persona.md
-systemctl --user restart together-ai
+systemctl --user restart bot-hub
 ```
 
 The running bot loads configuration at startup. Discord route changes take effect immediately. CLI configuration changes take effect after restarting the service. Channel route choices are persisted in SQLite.
@@ -85,23 +107,23 @@ Keep the Discord bot token and gateway API key in separate private files with mo
 The included service unit is configured for the current host. It starts with the user's systemd session and restarts automatically after failure. Adjust its absolute paths when moving the project.
 
 ```bash
-systemctl --user status together-ai
-journalctl --user -u together-ai -f
-systemctl --user restart together-ai
+systemctl --user status bot-hub
+journalctl --user -u bot-hub -f
+systemctl --user restart bot-hub
 ```
 
 The bot runs on this computer. Its availability depends on this computer and the configured gateway being online. Exa provides web search and fetching through its hosted MCP service. Its anonymous service has rate limits.
 
 ## Skill Issue Department
 
-The separate parent bot accepts explicit @mentions in the management channel `1571760182248218634` and its threads. Mention it with a Together AI change request. It creates a discussion thread and maintains a public status card with Edit request, approval and cancellation buttons. Thread follow-ups also require an @mention. The requester and server administrators can approve, edit, cancel and refine a proposal.
+The maintenance identity accepts explicit @mentions in the management channel `1571760182248218634` and its threads. Mention it with a Together AI change request. It creates a discussion thread and maintains a public status card with Edit request, approval and cancellation buttons. Thread follow-ups also require an @mention. The requester and server administrators can approve, edit, cancel and refine a proposal.
 
 The parent runs the installed protecting-your-energy `UserPromptSubmit` hook before each model planning call, uses source listing, reading, searching, settings inspection and proposal validation tools, asks necessary clarifying questions, and attaches a proposed diff. The thread shows actual model responses, tool calls and results, with long output attached as files. Confirmation queues the exact reviewed change. Source changes since review require a fresh proposal and approval. Requests are planned concurrently. Approved deployments are coordinated so changes cannot overwrite each other, and a stale preview requires renewed approval.
 
-The parent can edit Together AI’s project files, dependency manifests, child service unit and non-secret configuration, including gateway URLs, routes, aliases, connectors and skills. Credentials remain in their existing private files. Dependencies are synchronized and the service unit reloaded during deployment. The parent’s own runtime stays separate. Dependency installation or runtime validation failures trigger rollback.
+The parent can edit Together AI’s project files, dependency manifests, child service unit and non-secret configuration, including gateway URLs, routes, aliases, connectors and skills. Credentials remain in their existing private files. Dependencies are synchronized and the service unit reloaded during deployment. The maintenance client stays connected while the supervisor reloads the chat client. Dependency installation or runtime validation failures trigger rollback.
 
 Use Edit request on a completed card or @mention the parent in its thread to refine an implemented change. Each revision needs fresh approval. Changes are recorded locally by the parent in its audit database. Source publication remains an operator action.
 
-The parent runs through `skill-issue-department.service` with `PARENT_CONFIG` pointing at its private configuration. Together AI ignores the management channel and its threads so the parent owns that conversation. Both services run on this host.
+The maintenance preset runs within `bot-hub.service` using its private configuration. Together AI ignores the management channel and its threads so the maintenance preset owns that conversation. Both Discord identities run on this host.
 
 The parent defaults to `auto/best-free`. Planning uses staged edits and a finish tool, detects repeated inspection calls, and asks for a final proposal when inspection repeats.
