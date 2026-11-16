@@ -844,44 +844,52 @@ Use the most recent follow-up as the user's current intent. Be concise and light
         base_digest = self.digest(base)
         if resume:
             try:
-                if (
-                    resume.get("base_digest") != base_digest
-                    or resume.get("request_hash") != request_hash
-                ):
-                    raise ValueError("source or request changed")
-                if "context_hash" in resume:
-                    if resume.get("context_hash_version") == CONTEXT_HASH_VERSION:
-                        context_matches = resume["context_hash"] == context_hash
-                    elif resume.get("context_hash_version") is None:
-                        legacy_hash = hashlib.sha256(
-                            json.dumps(
-                                context,
-                                sort_keys=True,
-                                default=str,
-                                separators=(",", ":"),
-                            ).encode()
-                        ).hexdigest()
-                        context_matches = resume["context_hash"] == legacy_hash
+                if resume.get("base_digest") != base_digest:
+                    raise ValueError("source changed")
+                saved_request = resume.get("request")
+                request_changed = resume.get("request_hash") != request_hash
+                refinement = (
+                    request_changed
+                    and isinstance(saved_request, str)
+                    and str(request).startswith(saved_request + "\n\nFollow-up\n")
+                )
+                if request_changed and not refinement:
+                    raise ValueError("request was replaced")
+                if not refinement:
+                    if "context_hash" in resume:
+                        if resume.get("context_hash_version") == CONTEXT_HASH_VERSION:
+                            context_matches = resume["context_hash"] == context_hash
+                        elif resume.get("context_hash_version") is None:
+                            legacy_hash = hashlib.sha256(
+                                json.dumps(
+                                    context,
+                                    sort_keys=True,
+                                    default=str,
+                                    separators=(",", ":"),
+                                ).encode()
+                            ).hexdigest()
+                            context_matches = resume["context_hash"] == legacy_hash
+                        else:
+                            context_matches = False
+                        if not context_matches:
+                            raise ValueError(
+                                "supplied context, image data, or checkpoint hash format changed"
+                            )
                     else:
-                        context_matches = False
-                    if not context_matches:
-                        raise ValueError(
-                            "supplied context, image data, or checkpoint hash format changed"
+                        legacy_images = any(
+                            isinstance(message, dict)
+                            and isinstance(message.get("content"), list)
+                            and any(
+                                isinstance(part, dict)
+                                and part.get("type") == "image_url"
+                                for part in message["content"]
+                            )
+                            for message in resume.get("messages", [])
                         )
-                else:
-                    legacy_images = any(
-                        isinstance(message, dict)
-                        and isinstance(message.get("content"), list)
-                        and any(
-                            isinstance(part, dict) and part.get("type") == "image_url"
-                            for part in message["content"]
-                        )
-                        for message in resume.get("messages", [])
-                    )
-                    if context is not None or legacy_images:
-                        raise ValueError(
-                            "legacy checkpoint cannot validate supplied context or images"
-                        )
+                        if context is not None or legacy_images:
+                            raise ValueError(
+                                "legacy checkpoint cannot validate supplied context or images"
+                            )
                 if resume.get("route") not in {
                     self.config.get("model", "auto/best-free"),
                     fallback,
@@ -913,18 +921,51 @@ Use the most recent follow-up as the user's current intent. Be concise and light
                         [{"model": resume["route"], "reason": "resumed checkpoint"}],
                     )
                 )
-                messages = json.loads(json.dumps(saved_messages))
+                restored_messages = json.loads(json.dumps(saved_messages))
+                if refinement:
+                    initial_user = next(
+                        (
+                            message
+                            for message in restored_messages
+                            if message.get("role") == "user"
+                        ),
+                        None,
+                    )
+                    if initial_user is None:
+                        raise ValueError("checkpoint has no original user request")
+                    initial_user["content"] = self.planning_content(
+                        request, base, context
+                    )
+                    restored_messages.append(
+                        {
+                            "role": "user",
+                            "content": (
+                                "Refine the existing staged proposal using the appended requirements below. "
+                                "Retain useful inspections and staged edits, inspect the staged files when needed, "
+                                "and address this review before finishing a new proposal for approval."
+                                + str(request)[len(saved_request) :]
+                            ),
+                        }
+                    )
+                messages = restored_messages
                 staged = dict(saved_staged)
-                seen_calls = saved_calls
+                seen_calls = {} if refinement else saved_calls
                 turn = saved_turn
                 route = resume["route"]
-                force_final = bool(resume.get("force_final", False))
+                force_final = (
+                    False if refinement else bool(resume.get("force_final", False))
+                )
                 json_protocol = bool(resume.get("json_protocol", False))
                 use_json_format = bool(resume.get("use_json_format", True))
                 route_trace = saved_trace
-                await emit(
-                    f"Resuming the last validated planning checkpoint on {route}: {len(staged)} staged file(s), after turn {turn}."
-                )
+                if refinement:
+                    await emit(
+                        f"Resuming refinement on {route} with {len(staged)} staged file(s), retained inspections, and refreshed follow-up context."
+                    )
+                else:
+                    await emit(
+                        f"Resuming the last validated planning checkpoint on {route}: {len(staged)} staged file(s), after turn {turn}."
+                    )
             except (ValueError, TypeError, KeyError, SyntaxError):
                 await emit(
                     "The prior checkpoint does not match the current source, request, or supplied context/images. Starting a fresh plan from the current snapshot."
@@ -955,6 +996,7 @@ Use the most recent follow-up as the user's current intent. Be concise and light
                 {
                     "base_digest": base_digest,
                     "request_hash": request_hash,
+                    "request": str(request),
                     "context_hash": context_hash,
                     "context_hash_version": CONTEXT_HASH_VERSION,
                     "messages": saved,

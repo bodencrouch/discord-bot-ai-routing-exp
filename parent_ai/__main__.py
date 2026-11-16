@@ -16,44 +16,52 @@ from .recovery import SessionStore, rewind_activity
 
 
 def progress_icon(message):
-    """Choose a compact activity indicator without changing the underlying message."""
-    text = message.lower()
+    """Identify the step from its header, independently of quoted model output."""
+    text = message.lower().strip()
+    if text.startswith("tool call"):
+        tools = {
+            "read_file": "📄",
+            "search_source": "🔎",
+            "list_files": "🗂️",
+            "read_settings": "⚙️",
+            "stage_edit": "📝",
+            "validate_change": "✅",
+            "finish_change": "📋",
+        }
+        for name, icon in tools.items():
+            if f"**{name}**" in text[:100]:
+                return icon
+        return "🛠️"
     categories = (
-        ("🛠️", ("tool call",)),
         ("📥", ("tool result",)),
-        ("❌", ("request failed", "error", "timed out", "could not", "unavailable")),
-        ("🔄", ("retry", "retrying", "resuming", "checkpoint")),
+        ("❌", ("request failed:", "deployment failed")),
+        (
+            "🔄",
+            ("retry", "resuming", "transient planning failure", "the prior checkpoint"),
+        ),
+        ("⚠️", ("planning stream stopped", "the route did not return")),
         (
             "🚀",
             (
-                "deployment",
-                "deploying",
-                "applying",
+                "source matches",
                 "files applied",
+                "applying",
                 "restarting",
                 "reconnected",
-                "source matches",
                 "change is complete",
             ),
         ),
-        ("📋", ("proposal", "preview", "approval", "approved", "diff")),
-        ("🧭", ("hook", "protecting-your-energy")),
-        ("📚", ("retrieved", "context", "reading", "read ")),
-        (
-            "🧠",
-            (
-                "model turn",
-                "thinking",
-                "planning",
-                "stream active",
-                "route",
-                "protocol",
-            ),
-        ),
-        ("🛑", ("cancelled",)),
+        ("✅", ("final proposal validated", "final validation passed")),
+        ("📋", ("proposal ready", "approval received", "approved")),
+        ("📎", ("retrieved",)),
+        ("📚", ("reading", "read ")),
+        ("🧭", ("hook completed",)),
+        ("🧠", ("model turn", "planning stream", "stream active", "thinking")),
+        ("🔀", ("the configured route",)),
+        ("🛑", ("request cancelled", "cancelled")),
     )
-    for icon, terms in categories:
-        if any(term in text for term in terms):
+    for icon, prefixes in categories:
+        if text.startswith(prefixes):
             return icon
     return "💬"
 
@@ -379,6 +387,40 @@ class Parent(discord.Client):
                     await self.progress(job["id"], "Request failed: " + job["note"])
             except discord.NotFound:
                 await self.progress(job["id"], "Request failed: " + job["note"])
+        await self.run_cleanup_hook("cleanup_recover")
+
+    async def run_cleanup_hook(self, name, *args):
+        """Keep optional child cleanup integration isolated from Parent readiness."""
+        hook = getattr(self, name, None)
+        if hook is None:
+            return
+        try:
+            await hook(*args)
+        except Exception as error:
+            logging.warning("Cleanup hook %s failed (%s)", name, type(error).__name__)
+
+    async def on_guild_role_update(self, before, after):
+        if not self.user or str(after.guild.id) != str(self.config["guild_id"]):
+            return
+        member = after.guild.me
+        if (
+            member
+            and any(role.id == after.id for role in member.roles)
+            and before.permissions != after.permissions
+        ):
+            await self.run_cleanup_hook("cleanup_permissions_changed", after.guild.id)
+
+    async def on_member_update(self, before, after):
+        if (
+            self.user
+            and after.id == self.user.id
+            and str(after.guild.id) == str(self.config["guild_id"])
+            and (
+                before.roles != after.roles
+                or before.guild_permissions != after.guild_permissions
+            )
+        ):
+            await self.run_cleanup_hook("cleanup_permissions_changed", after.guild.id)
 
     async def close(self):
         if self.worker:
@@ -468,19 +510,6 @@ class Parent(discord.Client):
         embed.set_footer(
             text=f"Revision {job['version']} · requester or administrator approval required"
         )
-        kwargs = {"embed": embed, "view": view}
-        if attach and job["proposal"]:
-            p = json.loads(job["proposal"])
-            kwargs["attachments"] = [
-                discord.File(
-                    io.BytesIO(self.changes.diff(p).encode()),
-                    filename=f"change-{job_id}-v{job['version']}.diff",
-                ),
-                discord.File(
-                    io.BytesIO(p["plan"]["summary"].encode()),
-                    filename=f"proposal-{job_id}-v{job['version']}.md",
-                ),
-            ]
         for field, destination in (
             ("card", channel),
             ("thread_card", self.get_channel(job["thread"]) if job["thread"] else None),
@@ -508,12 +537,21 @@ class Parent(discord.Client):
             params = {"embed": embed, "view": view}
             if attach:
                 params["attachments"] = files
+            elif not job["proposal"]:
+                params["attachments"] = []
             if job[field]:
                 try:
                     msg = await destination.fetch_message(job[field])
-                    await msg.edit(**params)
-                    self.sessions.record_output(job_id, msg.id, destination.id, field)
-                    continue
+                    if field == "thread_card" and attach and job["proposal"]:
+                        await msg.edit(
+                            content="A newer proposal is available below.", view=None
+                        )
+                    else:
+                        await msg.edit(**params)
+                        self.sessions.record_output(
+                            job_id, msg.id, destination.id, field
+                        )
+                        continue
                 except discord.NotFound:
                     pass
             params.pop("attachments", None)
@@ -860,6 +898,29 @@ class Parent(discord.Client):
             ):
                 return
             plan = proposal["plan"]
+            saved = self.sessions.load(job_id)
+            if saved:
+                saved["state"]["staged"] = dict(plan["files"])
+                saved["state"]["messages"].append(
+                    {
+                        "role": "assistant",
+                        "content": "Current validated proposal for review\n"
+                        + json.dumps(
+                            {
+                                "summary": plan["summary"],
+                                "questions": plan["questions"],
+                                "config": plan["config"],
+                                "staged_files": list(plan["files"]),
+                            }
+                        ),
+                    }
+                )
+                await asyncio.to_thread(
+                    self.sessions.save,
+                    job_id,
+                    saved["state"],
+                    self.activity_messages.get(job_id),
+                )
             if plan["questions"]:
                 note = "\n".join(str(q) for q in plan["questions"])
                 state = "clarify"

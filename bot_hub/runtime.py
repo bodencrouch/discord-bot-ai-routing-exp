@@ -383,6 +383,9 @@ class Runtime:
             await interaction.response.send_message(
                 text, view=status_view(client, self)
             )
+            tracker = getattr(self.cleanup, "track_control", None)
+            if tracker:
+                tracker(await interaction.original_response())
 
     def project_channel_allowed(self, client, channel):
         if not channel or not getattr(channel, "guild", None):
