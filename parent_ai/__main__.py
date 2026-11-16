@@ -241,7 +241,16 @@ class Parent(discord.Client):
             )
             if thread.archived:
                 await thread.edit(archived=False)
-            await thread.send(f"**Activity · #{job_id}** {message}")
+            content = f"**Activity · #{job_id}** {message}"
+            if len(content) <= 1900:
+                await thread.send(content)
+            else:
+                await thread.send(
+                    f"**Activity · #{job_id}** Full model or tool output attached.",
+                    file=discord.File(
+                        io.BytesIO(message.encode()), filename="activity.txt"
+                    ),
+                )
         except discord.HTTPException:
             logging.exception("Could not post request activity")
 
